@@ -144,6 +144,10 @@ class TerminalState:
         self.round_label: str = MISSING
         self.seconds_left: int | None = None
         self.round_key: int | None = None
+        # Bumped by request_repaint(); the render loop forces a full redraw
+        # when it changes. A counter rather than a flag so a request raised
+        # while a frame is mid-build cannot be lost.
+        self.repaint_requests = 0
         # The round whose local inputs main_bot is currently evaluating.
         # This can briefly lag round_key while an old async validation unwinds.
         self.strategy_round_key: int | None = None
@@ -175,6 +179,10 @@ class TerminalState:
         self.trade_window: int | None = None
         self.max_buy_price: float | None = None
         self.min_buy_price: float | None = None
+        # The phase-1 band schedule, cadences already resolved, so the layout
+        # never has to consult config. Empty when phase 1 is parked.
+        self.bands: tuple = ()
+        self.bands_enabled: bool = False
         self.telemetry_error: str | None = None
         # Filled by run_feeds from the persistent live/paper Ledger.  The
         # dashboard never invents PnL from order acknowledgements.
@@ -185,6 +193,11 @@ class TerminalState:
         self.candles: Deque[Candle] = deque(maxlen=240)
         self.events: Deque[Event] = deque(maxlen=max_events)
         self.trades: list[dict] = []
+        # Exits the stop loss has taken, newest last, plus its current arming
+        # state. Kept separate from `trades` because an exit is not an entry:
+        # mixing them makes the trade table's SIDE/RESULT columns lie.
+        self.exits: list[dict] = []
+        self.stop_status: dict = {}
         self.overlay: Overlay | None = None
 
         # --- notes: things this build cannot source ----------------------
@@ -401,6 +414,24 @@ class TerminalState:
             self.down_book.set((clean_bids, clean_asks), latency_ms=latency_ms)
 
     # ------------------------------------------------------------ events
+    def request_repaint(self, why: str = "") -> int:
+        """Ask the render loop for one clean full redraw.
+
+        A reconnect can leave the terminal in an unknown state - a partially
+        written frame, or output from before the sink was in place. The
+        renderer paints only changed rows, so a row corrupted by something
+        other than the renderer matches `_prev` and is never rewritten: the
+        damage persists until something happens to change that row. This
+        forces the whole frame out once.
+
+        Only a counter is touched. Geometry is never altered here - the
+        render loop owns cols/rows, and a connection change must not resize
+        anything.
+        """
+        with self._lock:
+            self.repaint_requests += 1
+            return self.repaint_requests
+
     def event(self, tag: str, text: str, level: str = "info") -> None:
         with self._lock:
             tag = terminal_text(tag, 24).strip() or "LOG"

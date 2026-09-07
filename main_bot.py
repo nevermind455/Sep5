@@ -38,6 +38,12 @@ session_trades = []
 execution_mode = "LIVE"
 _paper_broker = None
 _accounting_enabled = False
+# How old the final-validation book may be before the depth/spread probe
+# refuses to reuse it and fetches its own. Normally the two are microseconds
+# apart - only local work separates them - so anything beyond this means a
+# blocking branch ran and the book is no longer the one that was validated.
+_FINAL_BOOK_REUSE_SECONDS = 1.0
+
 _round_exposure_provider = None
 _round_held_tokens_provider = None
 # Returns (entry_price, fee_per_share) for one open leg, or None. Only the
@@ -125,7 +131,11 @@ def _recover_boundary_print(window_start: int, timeout: float = 6.0):
 def price_signal(round_key: int, start_price, current_price):
     """Round-tagged Binance direction used by execution and dashboard telemetry."""
     del round_key  # Identity is consumed by the telemetry wrapper.
-    return strategy.decide(start_price, current_price)
+    # The momentum gate belongs to the Binance signal alone. Chainlink is a
+    # 60s TWAP of a different series; a bps threshold tuned to spot would not
+    # mean the same thing there.
+    return strategy.decide(start_price, current_price,
+                           config.SIG_PRICE_MIN_MOVE_BPS)
 
 
 def chainlink_signal(round_key: int, start_price, current_price):
@@ -146,7 +156,7 @@ def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
     if expected_side not in ("UP", "DOWN") or start_price is None:
         return False
     try:
-        sampled_wall = timer.wall()
+        sampled_wall = timer.unix()
         if timer.window_start(sampled_wall) != round_key:
             if signal_observer is not None:
                 signal_observer(None)
@@ -277,8 +287,22 @@ class _RoundSignalEpoch:
         if self.accepted_side is None or self.accepted_epoch is None:
             return False, "last accepted side is unavailable"
         if self.observed_side != side or self.epoch <= self.accepted_epoch:
-            return False, "no later non-neutral SIG PRICE transition was observed"
-        return True, "verified SIG PRICE transition"
+            return False, ("no later non-neutral transition of the deciding "
+                           "signal was observed")
+        return True, "verified transition of the deciding signal"
+
+
+def _authority_side(price_side, book_side, chainlink_side):
+    """The signal that actually decides the order side under this config.
+
+    The round epoch has to track whatever drives execution. Under the minority
+    rule the decision can flip because BOOK or CHAINLINK moved while SIG PRICE
+    stood still, and an epoch watching SIG PRICE alone would call that "no
+    transition" - refusing the very complement the flip was supposed to buy.
+    """
+    if config.SIGNAL_MINORITY_RULE:
+        return strategy.minority_decision(price_side, book_side, chainlink_side)
+    return price_side
 
 
 stop_event = threading.Event()
@@ -327,11 +351,21 @@ def _rotate_trade_log_if_stale() -> bool:
     return True
 
 
+# Which log path has already been checked for an old schema. Rotation can
+# only ever happen once per file, but the check itself opened and read the
+# CSV header on EVERY appended row - synchronous file I/O on the asyncio loop,
+# repeated for a decision that cannot change. Keyed by path rather than a bare
+# flag so redirecting TRADE_LOG still re-evaluates the new file.
+_rotation_checked: set = set()
+
+
 def _append_trade(row):
     row.setdefault("phase", "")
     session_trades.append(row)
     try:
-        _rotate_trade_log_if_stale()
+        if TRADE_LOG not in _rotation_checked:
+            _rotate_trade_log_if_stale()
+            _rotation_checked.add(TRADE_LOG)
         write_header = not TRADE_LOG.exists()
         with TRADE_LOG.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
@@ -347,9 +381,23 @@ def _append_trade(row):
 
 
 async def _cooldown(seconds: float | None = None) -> None:
+    """Wait out the trade interval, but never across a round boundary.
+
+    BUGFIX: this used to be a flat TRADE_INTERVAL_SECONDS sleep that only woke
+    for shutdown. Round rotation and the opening-print latch both live at the
+    TOP of the strategy loop, so a cooldown beginning a second or two before a
+    boundary held the loop for the rest of its 12s - and the new round was not
+    detected until ~10s in. By then the opening print, which is only latchable
+    from a trade stamped in the first 5 seconds, was already unreachable and
+    the round was lost. Returning at the boundary costs nothing: the loop
+    re-enters, sees the new window, and the interval restarts naturally.
+    """
     gap = config.TRADE_INTERVAL_SECONDS if seconds is None else seconds
     deadline = time.monotonic() + gap
+    entry_window = timer.window_start()
     while time.monotonic() < deadline and not stop_event.is_set():
+        if timer.window_start() != entry_window:
+            return
         await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
 
@@ -450,6 +498,10 @@ async def run_bot():
     last_status = 0.0
     skip_logged_window = None
     held_tokens: set[str] = set()
+    # Defined before the loop so the reuse test can never raise NameError on a
+    # path that reaches it without a final read. The sentinel token matches no
+    # real token id, so the fallback is always a fresh fetch.
+    final_book_token, final_book_mono = None, 0.0
     last_phase1 = 0.0
     signal_epoch = _RoundSignalEpoch()
 
@@ -505,7 +557,8 @@ async def run_bot():
     if drift is not None:
         print(
             f"{_ts()} [CLOCK] {clock_detail}; "
-            f"round timing uses CLOB-corrected time ({timer.clock_offset():+.3f}s local offset)"
+            f"round windows use Unix time, CLOB offset {timer.clock_offset():+.3f}s "
+            f"applies only to book timestamps"
         )
     else:
         print(f"{_ts()} [CLOCK] {clock_detail}")
@@ -520,7 +573,7 @@ async def run_bot():
             print(
                 f"{_ts()} [CLOCK] WARN: local clock is past the "
                 f"{config.CLOCK_MAX_DRIFT_SECONDS:.3f}s live limit; PAPER continues "
-                "on CLOB-corrected time so round identity matches Polymarket."
+                "and keeps Unix 5-minute windows so rounds match Polymarket slugs."
             )
         else:
             print(
@@ -531,7 +584,7 @@ async def run_bot():
     print(f"{_ts()} [BOT] Strategy loop started. Waiting for price feed and next round (ET)...")
 
     while not stop_event.is_set():
-        sampled_wall = timer.wall()
+        sampled_wall = timer.unix()
         remain = seconds_left(sampled_wall)
         round_window = timer.window_start(sampled_wall)
         round_end = round_window + 300
@@ -557,6 +610,12 @@ async def run_bot():
             # both legs of the same market) and when we last attempted.
             held_tokens = set()
             last_phase1 = 0.0
+            # Discovery answers the same question all round, so ask once.
+            # Re-fetching per attempt cost 8 gamma calls a round, and
+            # _fetch_slug retries twice at a 10s timeout: one bad call could
+            # burn ~21s of a 30s cadence slot, and last_phase1 is stamped
+            # BEFORE the fetch, so that attempt was simply lost.
+            round_tokens = None
             signal_epoch = _RoundSignalEpoch()
             # LIVE authorizations are keyed by the known five-minute window,
             # so they can be restored before discovery. PAPER inventory is
@@ -641,6 +700,31 @@ async def run_bot():
                 f"ends in {remain}s | {phase} | {price_txt}"
             )
 
+        # BUGFIX: this guard used to sit BETWEEN phase 1 and phase 2, so only
+        # phase 2 was ever reached by it - phase 1 had already `continue`d.
+        # SKIP_JOINED_ROUND then meant "phase 2 waits for a clean boundary
+        # while the bands trade the joined round anyway", which is not what
+        # either the switch or the rotation comment above says. It is not
+        # unreachable in practice: the round is joined with no opening print,
+        # but BOUNDARY_BACKFILL_AFTER recovers that print from REST a few
+        # seconds later, and from then on SIG PRICE is live and the bands
+        # trade. Reproduced with the phase-1 harness at 200s remaining: with
+        # the switch ON, phase 2 placed 0 orders and phase 1 still placed one.
+        #
+        # It belongs ahead of BOTH phases. Everything the round still needs
+        # while it is only being observed - the strike latch, the opening
+        # print, the status line - has already run above.
+        if (config.SKIP_JOINED_ROUND and joined_window is not None
+                and active_window == joined_window):
+            if skip_logged_window != active_window:
+                skip_logged_window = active_window
+                nxt = now_et(round_end).strftime("%I:%M%p ET").lstrip("0")
+                print(f"{_ts()} [ROUND] Joined this round in progress "
+                      f"({exact_remaining:.0f}s left); waiting for the next "
+                      f"market at {nxt}.")
+            await asyncio.sleep(0.2)
+            continue
+
         # ---- phase 1: price-band entry gated by SIG PRICE -----------------
         # The band still decides whether the selected contract is affordable;
         # fresh Binance direction is the sole authority for the order side.
@@ -660,8 +744,16 @@ async def run_bot():
             # venue minimum and the fee lands on top. A cap must reserve the
             # most the entry can cost, which is what entry_cost_ceiling gives.
             entry_ceiling = config.entry_cost_ceiling(band_hi)
-            tokens = await asyncio.to_thread(
-                market_discovery.get_tokens_for_current_round, active_window)
+            if round_tokens is None:
+                fetched = await asyncio.to_thread(
+                    market_discovery.get_tokens_for_current_round, active_window)
+                # Only a result matching this exact window is worth keeping.
+                # Caching a failure would take the whole round dark, so a bad
+                # call is simply retried on the next attempt.
+                if (fetched and fetched.get("window_start") == active_window
+                        and fetched.get("window_end") == round_end):
+                    round_tokens = fetched
+            tokens = round_tokens
             if (not tokens or tokens.get("window_start") != active_window
                     or tokens.get("window_end") != round_end):
                 await asyncio.sleep(0.2)
@@ -684,14 +776,25 @@ async def run_bot():
                 await asyncio.sleep(0.2)
                 continue
 
+            # Two independent reads of two different tokens, and the band test
+            # needs both before it can choose. Run them together: sequentially
+            # they cost two full round trips, and the second one's answer is
+            # already a round trip staler than the first by the time it lands.
+            legs = (("UP", up_id), ("DOWN", down_id))
+            books = await asyncio.gather(
+                *(asyncio.to_thread(orderbook.get_orderbook, token)
+                  for _candidate, token in legs),
+                return_exceptions=True)
+            for book in books:
+                if isinstance(book, asyncio.CancelledError):
+                    raise book          # shutdown, not a failed read
             in_band = []
-            for candidate, token in (("UP", up_id), ("DOWN", down_id)):
-                try:
-                    _bids, asks = await asyncio.to_thread(orderbook.get_orderbook, token)
-                except Exception as exc:
+            for (candidate, token), book in zip(legs, books):
+                if isinstance(book, BaseException):
                     print(f"{_ts()} [MARKET] phase1 book read failed "
-                          f"({candidate}): {type(exc).__name__}")
+                          f"({candidate}): {type(book).__name__}")
                     continue
+                _bids, asks = book
                 if not asks:
                     continue
                 ask = float(asks[0]["price"])
@@ -772,7 +875,7 @@ async def run_bot():
 
             # Discovery and two book reads take time; re-sample the boundary
             # immediately before submitting, exactly as the signal path does.
-            action_wall = timer.wall()
+            action_wall = timer.unix()
             if (timer.window_start(action_wall) != active_window
                     or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
                 print(f"{_ts()} [RISK] phase1 skip: round changed during validation.")
@@ -803,11 +906,21 @@ async def run_bot():
             print(f"{_ts()} [BOT] phase1 {verb}: {side} ${config.BET_SIZE} "
                   f"@ ask {ask:.3f} (T-{exact_remaining:.0f}s, window "
                   f"{_band_start}-{_band_end}s, band {band_lo:.2f}-{band_hi:.2f})")
-            # The band caps this order: without it a thin best level walks the
-            # book and fills outside the range being measured.
+            # The band bounds this order at BOTH ends: without the ceiling a
+            # thin best level walks the book past the band's top, and without
+            # the floor the walk can fill all the way down to MIN_BUY_PRICE.
+            #
+            # BUGFIX: only band_hi used to be passed. The floor existed solely
+            # in the validate_buy_liquidity check above, and the book moves
+            # between that check and the fill - so a leg quoted inside the band
+            # could fill below it. Verified against the paper fill engine with
+            # the 0.55-0.65 band: an ask of 0.54 and one of 0.40 both filled.
+            # Cheaper is not better here; the price fell because the market
+            # moved against the side being bought, and the fill lands outside
+            # the range the band experiment is measuring.
             ok = await asyncio.to_thread(
                 place_trade, side, config.BET_SIZE, up_id, down_id,
-                tokens["condition_id"], round_end, band_hi,
+                tokens["condition_id"], round_end, band_hi, min_price=band_lo,
                 pre_submit_guard=lambda: _fresh_price_permit(
                     active_window, start_price, side,
                     signal_observer=signal_epoch.observe))
@@ -828,17 +941,6 @@ async def run_bot():
                 "price_side": submit_price_side, "book_side": "", "chainlink_side": "",
                 "result": result,
             })
-            await asyncio.sleep(0.2)
-            continue
-
-        if (config.SKIP_JOINED_ROUND and joined_window is not None
-                and active_window == joined_window):
-            if skip_logged_window != active_window:
-                skip_logged_window = active_window
-                nxt = now_et(round_end).strftime("%I:%M%p ET").lstrip("0")
-                print(f"{_ts()} [ROUND] Joined this round in progress "
-                      f"({exact_remaining:.0f}s left); waiting for the next "
-                      f"market at {nxt}.")
             await asyncio.sleep(0.2)
             continue
 
@@ -895,8 +997,13 @@ async def run_bot():
 
             print(f"{_ts()} [BOT] Trade window ({exact_remaining:.2f}s left) - validating live state...")
 
-            tokens = await asyncio.to_thread(
-                market_discovery.get_tokens_for_current_round, active_window)
+            if round_tokens is None:
+                fetched = await asyncio.to_thread(
+                    market_discovery.get_tokens_for_current_round, active_window)
+                if (fetched and fetched.get("window_start") == active_window
+                        and fetched.get("window_end") == round_end):
+                    round_tokens = fetched
+            tokens = round_tokens
             if not tokens:
                 print(f"{_ts()} [BOT] WARN: No market tokens - cannot place order.")
                 await _cooldown(1.0)
@@ -935,7 +1042,8 @@ async def run_bot():
             )
 
             price_side = price_signal(active_window, start_price, lp)
-            signal_epoch.observe(price_side)
+            if not config.SIGNAL_MINORITY_RULE:
+                signal_epoch.observe(price_side)
             signal_epoch.initialize_from_durable(held_tokens, up_id, down_id)
             book_side = None
             chainlink_side = chainlink_signal(
@@ -956,7 +1064,25 @@ async def run_bot():
                 continue
             # Book and Chainlink remain visible diagnostics.  They may confirm
             # SIG PRICE, but they can never override the side sent to execution.
-            side = price_side
+            #
+            # Under SIGNAL_MINORITY_RULE they DO decide it: the order follows
+            # whichever side is outvoted. The fresh-SIG-PRICE gate above still
+            # runs first, so a stale or neutral price feed refuses the round
+            # either way - only the choice of side moves, never the decision
+            # about whether it is safe to trade at all.
+            if config.SIGNAL_MINORITY_RULE:
+                side = strategy.minority_decision(
+                    price_side, book_side, chainlink_side)
+                # Track the decision, not SIG PRICE: this is what a later flip
+                # has to differ from for the complement to be permitted.
+                signal_epoch.observe(side)
+                if side is None:
+                    print(f"{_ts()} [RISK] No order: signals are tied or "
+                          f"unanimous-neutral, so there is no minority side.")
+                    await asyncio.sleep(0.2)
+                    continue
+            else:
+                side = price_side
 
             print(
                 f"{_ts()} [SIGNAL] price={price_side} book={book_side or 'n/a'} "
@@ -987,7 +1113,7 @@ async def run_bot():
 
             # Discovery, book reads and clock I/O take time. Re-sample the
             # boundary immediately before any authenticated action.
-            action_wall = timer.wall()
+            action_wall = timer.unix()
             if (timer.window_start(action_wall) != active_window
                     or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
                 print(f"{_ts()} [RISK] No order: round changed during validation.")
@@ -1004,7 +1130,7 @@ async def run_bot():
                     await asyncio.sleep(0.5)
                     continue
 
-            action_wall = timer.wall()
+            action_wall = timer.unix()
             if (timer.window_start(action_wall) != active_window
                     or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
                 print(f"{_ts()} [RISK] No order: round changed before submission.")
@@ -1025,6 +1151,10 @@ async def run_bot():
             try:
                 final_bids, final_asks = await asyncio.to_thread(
                     orderbook.get_orderbook, ob_id)
+                # Stamp it: the depth/spread probe below can reuse this book
+                # instead of paying a second round trip for the same leg, but
+                # only while it is provably the same token and still fresh.
+                final_book_token, final_book_mono = ob_id, time.monotonic()
                 final_book_side = orderbook.liquidity_signal(final_bids, final_asks)
             except Exception as exc:
                 print(
@@ -1034,9 +1164,10 @@ async def run_bot():
                 await _cooldown(1.0)
                 continue
             final_price_side = price_signal(active_window, start_price, final_lp)
-            signal_epoch.observe(final_price_side)
             final_chainlink_side = chainlink_signal(
                 active_window, start_chainlink_price, final_cl)
+            signal_epoch.observe(_authority_side(
+                final_price_side, final_book_side, final_chainlink_side))
             _final_diagnostic_side = strategy.final_decision(
                 final_price_side, final_book_side, final_chainlink_side)
             if final_price_side is None:
@@ -1055,7 +1186,9 @@ async def run_bot():
             if other_token in held_tokens:
                 flip_allowed = False
                 flip_detail = "PAPER signal-flip mode is disabled"
-                if mode == "PAPER" and config.PAPER_ALLOW_SIGNAL_FLIPS:
+                flips_enabled = (config.PAPER_ALLOW_SIGNAL_FLIPS if mode == "PAPER"
+                                 else config.LIVE_ALLOW_SIGNAL_FLIPS)
+                if flips_enabled:
                     flip_allowed, flip_detail = signal_epoch.paper_flip_permit(side)
                 lock_ok = False
                 lock_detail = ("pair-lock is disabled"
@@ -1234,12 +1367,24 @@ async def run_bot():
             # Near expiry the selected token can lose all offers.  Book
             # liquidity is transient, so a failed probe skips this attempt
             # only; the next scheduled attempt probes the live book again.
+            selected_token = up_id if side == "UP" else down_id
+            # ob_id is the UP leg, so a DOWN order must still fetch its own
+            # book. The age test is what makes this safe on every path: the
+            # pair-lock and multi-signal branches each add a venue round trip
+            # between the two reads, and any of them pushes the stamp past
+            # the window, so the probe falls back to a fresh fetch by itself
+            # rather than relying on anyone tracing those branches by hand.
+            reuse_book = None
+            if (selected_token == final_book_token
+                    and time.monotonic() - final_book_mono
+                    <= _FINAL_BOOK_REUSE_SECONDS):
+                reuse_book = (final_bids, final_asks)
             try:
                 selected_bids, selected_asks = await asyncio.to_thread(
                     orderbook.validate_buy_liquidity,
-                    up_id if side == "UP" else down_id,
+                    selected_token,
                     config.BET_SIZE, config.MAX_BUY_PRICE, config.MAX_ALLOWED_SPREAD,
-                    min_price=config.MIN_BUY_PRICE)
+                    min_price=config.MIN_BUY_PRICE, book=reuse_book)
             except ValueError as exc:
                 print(
                     f"{_ts()} [RISK] No order this attempt: "
@@ -1317,7 +1462,7 @@ async def run_bot():
             book_side = submit_book_side
             chainlink_side = submit_chainlink_side
 
-            action_wall = timer.wall()
+            action_wall = timer.unix()
             if (timer.window_start(action_wall) != active_window
                     or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
                 print(f"{_ts()} [RISK] No order: round changed after final validation.")
@@ -1415,4 +1560,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from run_feeds import run_quietly
+    raise SystemExit(run_quietly(main()))

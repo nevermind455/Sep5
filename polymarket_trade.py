@@ -25,6 +25,10 @@ from py_clob_client_v2 import (
 _client = None
 _live_disabled = False
 _execution_lock = threading.Lock()
+# Exits take their own lock for the same reason PAPER does: an exit blocking an
+# entry costs the whole trade cycle, and the two are not duplicates of one
+# another.
+_exit_lock = threading.Lock()
 _state_lock = threading.RLock()
 _order_observer = None
 _journal_fault = None
@@ -47,6 +51,14 @@ HEX_SECRET_RE = re.compile(r"0x[0-9a-fA-F]{64}")
 FEE_PRECISION = Decimal("0.00001")
 _API_LOCK_WAIT_SECONDS = 10.0
 _CLOB_HTTP_TIMEOUT_SECONDS = 20.0
+# httpx defaults keepalive_expiry to 5s. Orders go out every
+# TRADE_INTERVAL_SECONDS (12s by default), so the pooled connection was always
+# expired by the time the next order needed it and every live order paid a
+# fresh TCP+TLS handshake. Measured against the live CLOB on a warm link that
+# is +86ms per order; on a cold link it is seconds. Held across a whole round
+# instead. The server may still close an idle connection - httpx reopens it,
+# which is exactly the old behaviour, so a long expiry costs nothing.
+_CLOB_KEEPALIVE_SECONDS = 300.0
 _CREDENTIAL_DERIVE_ATTEMPTS = 3
 _CREDENTIAL_DERIVE_BACKOFF_SECONDS = (1.0, 2.0)
 _clob_http_timeout_applied = False
@@ -152,7 +164,8 @@ def _apply_clob_http_timeout() -> None:
         return
     previous = getattr(helpers, "_http_client", None)
     helpers._http_client = httpx.Client(
-        http2=True, timeout=httpx.Timeout(_CLOB_HTTP_TIMEOUT_SECONDS))
+        http2=True, timeout=httpx.Timeout(_CLOB_HTTP_TIMEOUT_SECONDS),
+        limits=httpx.Limits(keepalive_expiry=_CLOB_KEEPALIVE_SECONDS))
     if previous is not None:
         try:
             previous.close()
@@ -449,9 +462,10 @@ def _build_receipt(resp: dict, oid: str, status: str | None, *, condition_id,
 def _size_to_venue_minimum(amount, asks, rules, cap) -> float:
     """Raise a dollar stake just enough to buy the venue's minimum shares.
 
-    Mirrors paper_trade.size_to_venue_minimum. Returns the stake unchanged
-    whenever it cannot verify a raise is needed - a missing book, an unusable
-    best ask, or one above the price cap - so an unreadable market can never
+    Mirrors paper_trade.size_to_venue_minimum, including a walk of the
+    executable asks. Best-ask * minimum under-sizes when the top of book
+    cannot fill 5 shares by itself. Returns the stake unchanged whenever
+    it cannot verify a raise is needed, so an unreadable market can never
     silently enlarge a live order.
     """
     try:
@@ -459,11 +473,27 @@ def _size_to_venue_minimum(amount, asks, rules, cap) -> float:
         minimum = Decimal(str(rules["minimum"]))
         if minimum <= 0 or not asks:
             return float(wanted)
-        best = Decimal(str(asks[0]["price"]))
         ceiling = Decimal(str(cap))
+        best = Decimal(str(asks[0]["price"]))
         if best <= 0 or best > ceiling:
             return float(wanted)
-        required = (minimum * best).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        remaining = minimum
+        notional = Decimal("0")
+        for level in asks:
+            price = Decimal(str(level["price"]))
+            available = Decimal(str(level["size"]))
+            if price <= 0 or price > ceiling or available <= 0:
+                if price > ceiling:
+                    break
+                continue
+            take = remaining if remaining <= available else available
+            notional += take * price
+            remaining -= take
+            if remaining <= 0:
+                break
+        if remaining > 0:
+            return float(wanted)
+        required = notional.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
         return float(wanted if wanted >= required else required)
     except (InvalidOperation, KeyError, TypeError, ValueError):
         return float(amount)
@@ -674,14 +704,91 @@ def _pre_submit_guard_error(pre_submit_guard) -> str | None:
     return None
 
 
+def sell_shares(token_id: str, shares: float, *, min_price: float = 0.0,
+                condition_id: str | None = None,
+                window_end: float | None = None) -> float:
+    """Live FAK exit. Returns shares submitted, or 0.0 if nothing was sent.
+
+    FAK, not FOK: an exit fills against whatever the book holds and cancels the
+    rest. FOK would refuse the whole order whenever the full size is not
+    resting at once, which is the normal state of the book a stop sells into -
+    it is thin precisely because the position has already gone wrong.
+
+    This deliberately does NOT reuse the entry preflight. That path exists to
+    stop us BUYING into resolution and checks USDC balance, round window and
+    price ceilings; none of it protects an exit, and some of it would block one
+    at exactly the moment a stop needs to act.
+    """
+    global last_order_error
+    if _live_disabled:
+        last_order_error = "live execution is disabled by paper mode"
+        return 0.0
+    token = str(token_id or "")
+    if not _valid_token(token):
+        last_order_error = "invalid token id"
+        return 0.0
+    try:
+        size = float(shares)
+        floor = float(min_price)
+    except (TypeError, ValueError):
+        last_order_error = "invalid sell size or floor"
+        return 0.0
+    if not math.isfinite(size) or size <= 0 or not 0.0 <= floor < 1.0:
+        last_order_error = "invalid sell size or floor"
+        return 0.0
+    if not _exit_lock.acquire(timeout=_API_LOCK_WAIT_SECONDS):
+        last_order_error = "timed out waiting for the live API"
+        return 0.0
+    try:
+        try:
+            if window_end is not None:
+                _validate_round_end(window_end)
+            client = _get_client()
+            mo = MarketOrderArgs(
+                token_id=token,
+                amount=size,             # SELL sizes in SHARES, not USDC
+                side=Side.SELL,
+                price=floor,
+                order_type=OrderType.FAK,
+            )
+            # No PartialCreateOrderOptions: the entry path derives tick/neg_risk
+            # from a validated UP/DOWN mapping it already holds, and an exit has
+            # only the one token. Letting the client resolve them from the token
+            # is correct here and avoids asserting a mapping we cannot check.
+            signed = client.create_market_order(mo)
+            resp = client.post_order(signed, OrderType.FAK)
+        except Exception as exc:
+            last_order_error = _safe_error(exc)
+            print(f"[LIVE] Sell failed: {last_order_error}")
+            return 0.0
+        oid, status, err = _accepted_order_response(resp)
+        if err is not None:
+            last_order_error = _safe_error(err)
+            print(f"[LIVE] Sell rejected: {last_order_error}")
+            return 0.0
+        last_order_error = None
+        print(f"[LIVE] Sell submitted: {size:.6f} sh floor {floor:.4f} "
+              f"status={status} id={str(oid)[-12:]}")
+        return size
+    finally:
+        _exit_lock.release()
+
+
 def place_trade(side: str, amount: float, up_token_id: str | None = None,
                 down_token_id: str | None = None,
                 condition_id: str | None = None,
                 window_end: float | None = None,
-                max_price: float | None = None, *, pre_submit_guard=None) -> bool:
+                max_price: float | None = None,
+                min_price: float | None = None, *,
+                pre_submit_guard=None) -> bool:
     """Serialize live submissions so two callers cannot duplicate an entry.
 
     `max_price` caps this order alone, and may only tighten MAX_BUY_PRICE.
+    `min_price` is its mirror: a floor for this order alone, which may only
+    RAISE MIN_BUY_PRICE. A band caller needs both. Passing only the ceiling
+    let a band's walk stop at the band's top but still fill anywhere down to
+    the account-wide floor - outside the band being measured, and into a book
+    that has moved against the side being bought.
     `pre_submit_guard`, when supplied, must return literal ``True`` immediately
     before each signing/POST boundary.  It may reject, but never changes side.
     """
@@ -693,7 +800,7 @@ def place_trade(side: str, amount: float, up_token_id: str | None = None,
         return False
     try:
         return _place_trade(side, amount, up_token_id, down_token_id,
-                            condition_id, window_end, max_price,
+                            condition_id, window_end, max_price, min_price,
                             pre_submit_guard=pre_submit_guard)
     finally:
         _execution_lock.release()
@@ -703,7 +810,9 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                  down_token_id: str | None = None,
                  condition_id: str | None = None,
                  window_end: float | None = None,
-                 max_price: float | None = None, *, pre_submit_guard=None) -> bool:
+                 max_price: float | None = None,
+                 min_price: float | None = None, *,
+                 pre_submit_guard=None) -> bool:
     global last_order_error, last_order_status, last_order_receipt, _journal_fault
     last_order_error = None
     last_order_status = None
@@ -773,7 +882,12 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             # Tighten only: an order cap can never raise the account ceiling.
             ceiling = min(ceiling, float(max_price))
         limit = _round_limit(ceiling, rules["tick"])
-        floor = _round_floor(config.MIN_BUY_PRICE, rules["tick"])
+        base_floor = config.MIN_BUY_PRICE
+        if min_price is not None:
+            # Raise only, mirroring the ceiling's tighten-only rule: an order
+            # floor can never drop below the account-wide minimum.
+            base_floor = max(base_floor, float(min_price))
+        floor = _round_floor(base_floor, rules["tick"])
         if floor > limit:
             raise RuntimeError(
                 "the effective price floor is above the order's price cap")

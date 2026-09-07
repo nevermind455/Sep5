@@ -107,7 +107,7 @@ def main(argv=None) -> int:
 
     winners = json.loads(WINNERS.read_text()) if WINNERS.exists() else {}
     todo = [w for w in journal_windows() if str(w) not in winners]
-    now = timer.wall()
+    now = timer.unix()
 
     too_young = [w for w in todo if now - (w + WINDOW_SECONDS) < SETTLE_GRACE_SECONDS]
     ready = [w for w in todo if w not in set(too_young)]

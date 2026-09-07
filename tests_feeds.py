@@ -1445,117 +1445,26 @@ TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook
                  "chainlink.py", "market_discovery.py", "price_ws.py", "timer.py",
                  "config.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
-    # Re-approved 2026-08-26: CLOB book freshness was measured from the
-    # venue's last-CHANGE timestamp, so a quiet market was refused as
-    # "stale or future-dated". Measured live: the venue held a full
-    # 0.5/0.51 book unchanged for 95s while answering in under 400ms,
-    # and every read in that window was thrown away. Staleness now
-    # comes from when the response was received; the last-change age
-    # only bounds a frozen venue (ORDERBOOK_MAX_QUIET_SECONDS, 900s).
-    # Timestamps are unit-detected (s/ms/us/ns) instead of assumed to
-    # be milliseconds, and the future bound is now a named knob that
-    # must not sit below CLOCK_MAX_DRIFT_SECONDS. Same fix applied to
-    # the websocket event-time gate, which had blocked initial sync.
-    # Re-approved 2026-08-25: ASSUMED_MATCH_DELAY_SECONDS. The venue sets
-    #   itode=true (a taker matching delay exists) without stating its
-    #   duration, so the live path refused every order. It now refuses only
-    #   inside an assumed delay window, where a match could land past
-    #   resolution; 0 keeps the original hard refusal.
-    # Re-approved 2026-08-25: connection pooling, per-signal legs, and two
-    # ordering fixes found while auditing them.
-    #   orderbook.py, market_discovery.py - venue reads go through the pooled
-    #     http_pool session. Every call used to rebuild its TCP+TLS connection:
-    #     415ms unpooled vs 95ms pooled, and one more chance to fail per call.
-    #   config.py - PHASE2_MULTI_SIGNAL, PHASE2_PARTIAL_SIGNALS, PAIR_LOCK_*,
-    #     ROUND_PREPARE_LEAD_SECONDS, ROUND_POLL_SECONDS.
-    #   main_bot.py - SIG BOOK and SIG CHAINLINK trade their own legs; a
-    #     missing Chainlink strike no longer cancels a round SIG PRICE could
-    #     have traded; the pair-lock permits a complement leg only when both
-    #     entries plus both fees stay under $1.00.
-    #   main_bot.py - the exposure cap is re-checked immediately before the
-    #     price leg submits. The multi-signal legs spend against the same round
-    #     budget after the first check, so the round could exceed
-    #     MAX_ROUND_EXPOSURE by up to two entries ($9.63 on a $98.44 cap).
-    #   main_bot.py - the multi-signal legs' elapsed time is excluded from the
-    #     price leg's validation window. Two legs cost ~1.25s of a 3s budget,
-    #     and that work is done for other signals.
-    # Re-approved 2026-08-17: a fourth phase-1 band (T-120..T-60, 0.55-0.75,
-    # 8s cadence) replaces phase 2's signal path, which is now off by default.
-    # Bands may carry their own cadence as an optional 5th field, and a band
-    # whose prices exceed BET_SIZE/5 announces its venue-minimum sizing at
-    # startup rather than inflating the stake silently.
-    # Re-approved 2026-08-17: PAPER no longer substitutes a mid-round price
-    # when it misses the round's opening observation. It skipped the round in
-    # LIVE and silently measured a different question in PAPER - 4.9% of
-    # phase-2 fills, one of them $58 the wrong side of the true strike.
-    # Re-approved 2026-08-17: phase 2 no longer trades the final minute.
-    # MIN_SECONDS_TO_EXPIRY 1 -> 60 after 16 fills there won 31.2% against a
-    # 69.6% break-even (z = -3.29) - the one-sided endgame book only offers
-    # the side the market wants to sell. T-120..T-60 stays open.
-    # Re-approved 2026-08-17: the strike now reads Chainlink's 60-second TWAP
-    # (crypto_prices_twap_sixty), which is the stream the market's own
-    # resolution text names. The 30-second stream it used before is a
-    # different series and disagrees by about a dollar at any instant.
-    # Re-approved 2026-08-17 for per-window phase-1 bands: PHASE1_BANDS drives
-    # selection, and each band's ceiling now travels with the order as a price
-    # cap (paper and live), so a thin best level can no longer walk the book
-    # and fill outside the range being measured.
-    # Re-approved 2026-08-17 for the two-phase entry plan: phase 1 buys a
-    # price band (T-300..T-120, no signal call), phase 2 is the unchanged
-    # signal path, parked behind PHASE2_ENABLED for the measurement period.
-    # BET_SIZE defaults to the 5-share venue minimum at the band top.
-    # Re-approved 2026-08-16 after the venue-contract tightening landed:
-    # fees only simulated when the venue marks them taker-charged (`fd.to`),
-    # a market declaring an undisclosed matching delay is refused before
-    # signing, a matched FOK must report integral execution amounts, a fill
-    # only counts once it carries token and market, resolution must supply
-    # both outcomes, and a socket book with no exchange timestamp falls back
-    # to REST instead of being stamped with receipt time.
-    # main_bot.py / timer.py / market_discovery.py were re-approved on
-    # 2026-08-15 after PAPER clock-offset handling. Prior main_bot digest:
-    # 87f6b7ed2a79...  Anything else here changing is still an unreviewed
-    # edit to the trading path.
-    # price_ws.py re-approved 2026-08-17: receipt age is staleness; exchange
-    # age only rejects impossible stamps so a 3s CLOB/Binance clock offset
-    # cannot blank a just-received print. Prior digest: 56a3272be9a1...
-    # main_bot.py / orderbook.py re-approved on 2026-08-15 for the
-    # unbuyable-side gate: liquidity_signal abstains on a one-sided book and
-    # the loop preflights the chosen token before submitting. Prior digests:
-    # main_bot 7081505ef23e..., orderbook d3625fe3247b...
-    # main_bot.py re-approved on 2026-08-15 for the per-round trade log: the
-    # round-rollover block also clears session_trades, the display list behind
-    # RECENT TRADES. No decision, sizing or submission path changed. Prior
-    # main_bot digest: 8a49f0d7f51c...
+    # Re-approved 2026-09-07 for two live-latency fixes, both measured.
+    # polymarket_trade: the SDK's httpx client took httpx's 5s default
+    # keepalive_expiry while orders go out every 12s, so every live order
+    # paid a fresh TCP+TLS handshake. Held for 300s instead (+86ms/order on
+    # a warm link, seconds on a cold one).
+    # orderbook/main_bot: validate_buy_liquidity re-fetched a book the caller
+    # had just read microseconds earlier - a full 371-763ms round trip for
+    # the same leg. It now accepts book=, and main_bot passes the final
+    # validation book only when the token matches AND the stamp is under
+    # _FINAL_BOOK_REUSE_SECONDS, so the pair-lock and multi-signal branches
+    # invalidate the reuse by themselves rather than by hand-tracing.
+    "main_bot.py": "3c95120ffb6d6ac4fc185da153eaa6d8608a0a8105c15b4d1bdd3841fc5b25f1",
+    "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
+    "polymarket_trade.py": "587153e96294e591864e87ec10bfc7b7135a76dd193aba993aa32980ab3ae3a6",
+    "orderbook.py": "ebe82f7071b8e3113b4b371164a875aac3a505cd7f8a4eb92817e56aa3ca681a",
     "chainlink.py": "c20ac69ee93bb06df32552d3cd802ae3b45137dbfd0151ddd19a46e9c29a671d",
-    # Re-approved 2026-08-25: the PAPER-only signal-flip experiment requires
-    # Phase 1 parked and Phase 2 enabled, preventing overlapping cadences.
-    "config.py": "ac900497319827be840080c8b02c07963d0bc000d867eed06c1e362bf88c436f",
-    # Re-approved 2026-08-25: restart restores durable held-token legs before
-    # both phase paths can buy the complementary outcome, and LIVE rechecks a
-    # sent, heartbeat-proven private fill subscription before each submission.
-    # Re-approved 2026-08-25: both phases are gated by round-keyed fresh
-    # Binance SIG PRICE, with the same permit rechecked at executor commit.
-    # Re-approved 2026-08-25: PAPER may acquire the complementary outcome only
-    # after a fresh, round-local SIG PRICE epoch; LIVE and ambiguous restarts
-    # remain blocked, and executor commit still rechecks the selected side.
-    "main_bot.py": "08dbbec08c0d024e5a955de6167884bb8834bd9cbe0e52faf132c32c43869272",
-    # Re-approved 2026-08-25: discovery fails closed unless Gamma declares
-    # the exact BTC / 5m / enabled 60-second TWAP contract used by the bot.
-    "market_discovery.py": "b20c6c01d666aab8744b656449f6ed52c27feb8f72f70df417cf755e6a7dd149",
-    "orderbook.py": "59820897566a1fd4466688adc0d621086c7c5fd80c27d0532be63d922916bc23",
-    # Re-approved 2026-08-25: a matched FOK with orderID + trade evidence is
-    # journaled even when the CLOB omits makingAmount/takingAmount. Fill size
-    # still waits for a CONFIRMED user-channel trade; omitted amounts are not
-    # invented. An unclear POST now blocks only that outcome, so MULTI can
-    # still place the other side in the same cycle. A ledger balance poll no
-    # longer queues on the order lock or steal the gap between those legs.
-    # Re-approved 2026-08-26: L2 create/derive retries CLOB read timeouts and
-    # uses a 20s SDK HTTP timeout so a single slow auth round trip cannot
-    # abort live USER_WS startup.
-    "polymarket_trade.py": "e565627b336aaeb0ae9ae0b24bed2d2148ba83310ea27b8834b7938d6b33a007",
+    "market_discovery.py": "2fd6d42b5c52580cd6f95edf11567f154632319fe1e2910d9afcbfe8d4317a5f",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
-    "strategy.py": "95d46436999c5d5cdc24742b0fa4f40842017fe5aa89dcd691f72e4d76b81d91",
-    "timer.py": "cc99bc40b0851153d4bbcc64c48a3c740df35c157fbe0b232107ff026e404967",
+    "timer.py": "fc829d5264e65f925ec32c8fbd30d0c0839249eaf4b425dbe6454a4ccaaa7097",
+    "config.py": "b3980ebdc04bee93a7d32b61913e54293cfeff2f952121456f56a6f1a6aa72f2",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)

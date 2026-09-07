@@ -69,6 +69,19 @@ if TRADE_LAST_SECONDS is None:
     raise ValueError("TRADE_LAST_SECONDS cannot be empty")
 TRADE_INTERVAL_SECONDS = _env_float("TRADE_INTERVAL_SECONDS", "6")
 MAX_BUY_PRICE = _env_float("MAX_BUY_PRICE", "0.90")
+# Momentum gate on SIG PRICE, in basis points of the opening print. The
+# Binance move from the open must be at least this large before it votes at
+# all. strategy.decide has always returned a full-confidence UP/DOWN for any
+# non-zero move, so a $0.01 drift on $79,000 (0.0013bps) selected a side as
+# firmly as a $200 run - and paid the same ask for it. MOMENTUM on the
+# dashboard has displayed that magnitude all along without anything acting
+# on it; this is the knob that acts on it.
+#
+# 0 = off, exactly the historical behaviour. Do NOT guess a value: the
+# journal (signal_journal.py analyze) measures accuracy by move size, and at
+# the time of writing it held 7 rounds against the ~1,111 it says are needed
+# to read a 3-point edge.
+SIG_PRICE_MIN_MOVE_BPS = _env_float("SIG_PRICE_MIN_MOVE_BPS", "0")
 MIN_BUY_PRICE = _env_float("MIN_BUY_PRICE", "0.20")
 BTC_STALE_AFTER = _env_float("BTC_STALE_AFTER", "3.0")
 # How long the book we hold may have been in our hands. For a REST read
@@ -86,6 +99,37 @@ ORDERBOOK_MAX_QUIET_SECONDS = _env_float("ORDERBOOK_MAX_QUIET_SECONDS", "900.0")
 ORDERBOOK_FUTURE_TOLERANCE_SECONDS = _env_float(
     "ORDERBOOK_FUTURE_TOLERANCE_SECONDS", "5.0")
 MAX_ALLOWED_SPREAD = _env_float("MAX_ALLOWED_SPREAD", "0.25")
+
+# ---- HTTP transport: how venue reads survive a bad link --------------------
+# Every unauthenticated venue read goes through http_pool on a kept-alive
+# connection. Two failure modes cost real rounds:
+#
+#   1. The peer resets a pooled connection mid-request. urllib3 already
+#      re-opens a connection the peer closed CLEANLY, but a reset while the
+#      request is in flight surfaces as a read error and, with the stock
+#      adapter's Retry(total=0), propagates straight to the caller. Measured
+#      locally against a socket that RSTs the second request: ConnectionError
+#      with the stock adapter, recovered in 15ms with one read retry.
+#   2. The peer accepts and then goes silent. Only a timeout ends that, and a
+#      scalar requests timeout is applied to the connect AND the read phase
+#      separately, so `timeout=8` means up to 16s, not 8s.
+#
+# Retries here are transport-only. Callers that care about 429/5xx already
+# implement their own backoff with Retry-After, and retrying in both places
+# would multiply attempts inside a budget measured in single seconds.
+HTTP_TRANSPORT_RETRIES = _env_int("HTTP_TRANSPORT_RETRIES", "1")
+if HTTP_TRANSPORT_RETRIES is None or not 0 <= HTTP_TRANSPORT_RETRIES <= 3:
+    raise ValueError("HTTP_TRANSPORT_RETRIES must be between 0 and 3")
+HTTP_RETRY_BACKOFF_SECONDS = _env_float("HTTP_RETRY_BACKOFF_SECONDS", "0.1")
+# Establishing a connection is either fast or not happening. Kept separate
+# from the read budget so a caller asking for an 8s read cannot silently wait
+# 16s, and so a dead route fails while the round is still tradeable.
+HTTP_CONNECT_TIMEOUT_SECONDS = _env_float("HTTP_CONNECT_TIMEOUT_SECONDS", "4.0")
+# Keepalive probes on idle pooled sockets. Between trade cycles a connection
+# can be dropped by a NAT or load balancer without a FIN ever arriving; the
+# next read then blocks for the full timeout instead of failing at once.
+HTTP_KEEPALIVE_IDLE_SECONDS = _env_int("HTTP_KEEPALIVE_IDLE_SECONDS", "30")
+HTTP_KEEPALIVE_INTERVAL_SECONDS = _env_int("HTTP_KEEPALIVE_INTERVAL_SECONDS", "10")
 CLOCK_MAX_DRIFT_SECONDS = _env_float("CLOCK_MAX_DRIFT_SECONDS", "2.0")
 PAPER_LATENCY_MS = _env_float("PAPER_LATENCY_MS", "150")
 TWAP_STALE_AFTER = _env_float("TWAP_STALE_AFTER", "10.0")
@@ -193,6 +237,17 @@ if PAPER_ALLOW_SIGNAL_FLIPS and (PHASE1_ENABLED or not PHASE2_ENABLED):
         "PAPER_ALLOW_SIGNAL_FLIPS requires PHASE1_ENABLED=0 and "
         "PHASE2_ENABLED=1 so band and signal cadences cannot overlap")
 
+# Permit the complement leg in LIVE after a verified signal reversal, the way
+# PAPER_ALLOW_SIGNAL_FLIPS does for paper. This is a risk decision, not a bug
+# fix: two independent venue orders are not an atomic pair, so a reversal can
+# leave the account holding one leg at a price the second leg never matched -
+# in PAPER that costs nothing, in LIVE it is real money on an unhedged side.
+# Off by default; enabling it is choosing that exposure knowingly.
+LIVE_ALLOW_SIGNAL_FLIPS = bool(_env_bool("LIVE_ALLOW_SIGNAL_FLIPS", False))
+if LIVE_ALLOW_SIGNAL_FLIPS and (PHASE1_ENABLED or not PHASE2_ENABLED):
+    raise ValueError(
+        "LIVE_ALLOW_SIGNAL_FLIPS requires PHASE1_ENABLED=0 and PHASE2_ENABLED=1")
+
 # Give SIG BOOK and SIG CHAINLINK their own orders instead of leaving them as
 # diagnostics. Each non-neutral signal trades its own side, so a round where
 # they disagree buys BOTH legs on purpose. Measured on 1,957 logged decisions
@@ -261,12 +316,27 @@ SKIP_JOINED_ROUND = bool(_env_bool("SKIP_JOINED_ROUND", False))
 
 PHASE2_PARTIAL_SIGNALS = bool(_env_bool("PHASE2_PARTIAL_SIGNALS", False))
 
+# Order side follows the DISSENTING signal when the three disagree, instead of
+# SIG PRICE unconditionally. Measured over 275 archived rounds this scored -5.83
+# per $100 against -1.90 for SIG PRICE alone, so it is off by default and is
+# selected deliberately. Requires PHASE2_MULTI_SIGNAL off: the minority rule
+# picks ONE side, and multi-signal exists to buy several.
+SIGNAL_MINORITY_RULE = bool(_env_bool("SIGNAL_MINORITY_RULE", False))
+
 PHASE2_MULTI_SIGNAL = bool(_env_bool("PHASE2_MULTI_SIGNAL", False))
 if PHASE2_MULTI_SIGNAL and not PHASE2_ENABLED:
     raise ValueError("PHASE2_MULTI_SIGNAL requires PHASE2_ENABLED=1")
+if SIGNAL_MINORITY_RULE and PHASE2_MULTI_SIGNAL:
+    raise ValueError(
+        "SIGNAL_MINORITY_RULE selects a single dissenting side; it cannot be "
+        "combined with PHASE2_MULTI_SIGNAL, which buys one leg per signal")
 if PHASE2_MULTI_SIGNAL and PAPER_ALLOW_SIGNAL_FLIPS:
     raise ValueError(
         "PHASE2_MULTI_SIGNAL and PAPER_ALLOW_SIGNAL_FLIPS both relax the "
+        "complement guard by different rules; enable exactly one")
+if PHASE2_MULTI_SIGNAL and LIVE_ALLOW_SIGNAL_FLIPS:
+    raise ValueError(
+        "PHASE2_MULTI_SIGNAL and LIVE_ALLOW_SIGNAL_FLIPS both relax the "
         "complement guard by different rules; enable exactly one")
 
 # The order path refuses any submission outside the round's execution
@@ -368,6 +438,47 @@ def _round_entry_budget() -> float:
 
 MAX_ROUND_EXPOSURE = _env_float("MAX_ROUND_EXPOSURE", str(_round_entry_budget()))
 
+# ---- stop loss --------------------------------------------------------------
+# Sell a held leg once its BID reaches STOP_LOSS_PRICE. This is a client-side
+# trigger, not an order type: the CLOB has only FAK/FOK/GTC/GTD, so nothing
+# resting on the book can act as a stop. A resting sell fills when price RISES,
+# which is a take-profit; a stop has to be watched and then crossed.
+#
+# Measured over 275 archived rounds: 14.1% of legs that eventually WON traded
+# at or below 0.25 first, dipping as low as 0.04 with 143s still to run. A stop
+# therefore cuts roughly one winner in seven. On both-leg rounds the exit was
+# worth +$392 (t=+3.44) because it was selling a structurally dead second leg;
+# on single-leg rounds the same test came out at -0.58. Whether it pays depends
+# entirely on the haircut actually paid on the way out, which no archived run
+# recorded, so this ships OFF and instrumented.
+STOP_LOSS_ENABLED = bool(_env_bool("STOP_LOSS_ENABLED", False))
+STOP_LOSS_PRICE = _env_float("STOP_LOSS_PRICE", "0.25")
+# The absolute worst price the exit may accept while walking the book down.
+# Setting this to the trigger price makes the stop a pure limit that simply
+# does not fill in a thin book; lowering it buys certainty of exit with price.
+# At a haircut beyond 0.19 the measured benefit inverts, so a floor far below
+# the trigger is choosing execution over expectancy - deliberately.
+STOP_LOSS_FLOOR_PRICE = _env_float("STOP_LOSS_FLOOR_PRICE", "0.05")
+# Do not arm before this many seconds remain. The winners that recovered from
+# under 0.25 did so at 93-209s left; a stop armed round-wide cut 13 of them
+# against 5 when it only armed inside 120s.
+STOP_LOSS_ARM_SECONDS = _env_float("STOP_LOSS_ARM_SECONDS", "120")
+# Stop placing exits this close to expiry. The trader studied here stopped
+# trading entirely at T-30 and placed nothing in the final 30 seconds.
+STOP_LOSS_EXIT_CUTOFF_SECONDS = _env_float("STOP_LOSS_EXIT_CUTOFF_SECONDS", "20")
+STOP_LOSS_POLL_SECONDS = _env_float("STOP_LOSS_POLL_SECONDS", "1.0")
+if not 0.0 < STOP_LOSS_PRICE < 1.0:
+    raise ValueError("STOP_LOSS_PRICE must be strictly between 0 and 1")
+if not 0.0 < STOP_LOSS_FLOOR_PRICE <= STOP_LOSS_PRICE:
+    raise ValueError(
+        "STOP_LOSS_FLOOR_PRICE must be in (0, STOP_LOSS_PRICE]: a floor above "
+        "the trigger could never fill")
+if not 0.0 <= STOP_LOSS_EXIT_CUTOFF_SECONDS < STOP_LOSS_ARM_SECONDS <= 300.0:
+    raise ValueError(
+        "need 0 <= STOP_LOSS_EXIT_CUTOFF_SECONDS < STOP_LOSS_ARM_SECONDS <= 300")
+if not 0.2 <= STOP_LOSS_POLL_SECONDS <= 30.0:
+    raise ValueError("STOP_LOSS_POLL_SECONDS must be between 0.2 and 30")
+
 CANCEL_OPEN_BEFORE_TRADE = bool(_env_bool("CANCEL_OPEN_BEFORE_TRADE", False))
 ALLOW_GLOBAL_CANCEL_ALL = bool(_env_bool("ALLOW_GLOBAL_CANCEL_ALL", False))
 ALLOW_CUSTOM_CLOB_HOST = bool(_env_bool("ALLOW_CUSTOM_CLOB_HOST", False))
@@ -446,6 +557,14 @@ _finite_positive("CLOCK_MAX_DRIFT_SECONDS", CLOCK_MAX_DRIFT_SECONDS)
 if not math.isfinite(PAPER_LATENCY_MS) or PAPER_LATENCY_MS < 0:
     raise ValueError("PAPER_LATENCY_MS must be finite and non-negative")
 _finite_positive("TWAP_STALE_AFTER", TWAP_STALE_AFTER)
+_finite_positive("HTTP_CONNECT_TIMEOUT_SECONDS", HTTP_CONNECT_TIMEOUT_SECONDS)
+if not math.isfinite(HTTP_RETRY_BACKOFF_SECONDS) or not 0 <= HTTP_RETRY_BACKOFF_SECONDS <= 2:
+    raise ValueError("HTTP_RETRY_BACKOFF_SECONDS must be between 0 and 2")
+if HTTP_KEEPALIVE_IDLE_SECONDS is None or not 1 <= HTTP_KEEPALIVE_IDLE_SECONDS <= 3600:
+    raise ValueError("HTTP_KEEPALIVE_IDLE_SECONDS must be between 1 and 3600")
+if (HTTP_KEEPALIVE_INTERVAL_SECONDS is None
+        or not 1 <= HTTP_KEEPALIVE_INTERVAL_SECONDS <= 3600):
+    raise ValueError("HTTP_KEEPALIVE_INTERVAL_SECONDS must be between 1 and 3600")
 if (not math.isfinite(MIN_SECONDS_TO_EXPIRY)
         or not 0 <= MIN_SECONDS_TO_EXPIRY < TRADE_LAST_SECONDS):
     raise ValueError("MIN_SECONDS_TO_EXPIRY must be non-negative and below TRADE_LAST_SECONDS")

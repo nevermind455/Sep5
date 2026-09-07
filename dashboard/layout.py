@@ -100,10 +100,14 @@ def snapshot(st: TerminalState, session_trades: list | None = None) -> dict[str,
             "candle_t": [c.t for c in st.candles],
             "events": copy.deepcopy(list(st.events)[-80:]),
             "trades": trades,
+            "exits": [copy.deepcopy(e) for e in list(st.exits)[-40:]],
+            "stop_status": copy.deepcopy(st.stop_status) if isinstance(st.stop_status, Mapping) else {},
             "absent": dict(st.absent),
             "overlay": copy.deepcopy(st.overlay),
             "loop_status": st.loop_beat.status_at(3.0, 12.0, now_mono),
             "loop_age": st.loop_beat.age_at(now_mono),
+            "bands": tuple(st.bands),
+            "bands_enabled": bool(st.bands_enabled),
             "bet_size": _finite(st.bet_size),
             "trade_window": st.trade_window,
             "max_buy_price": _finite(st.max_buy_price),
@@ -123,6 +127,17 @@ def _finite(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _up_down_share(trades, field: str) -> str | None:
+    """Count this-round journal sides for one signal. Missing sides stay out."""
+    if not trades:
+        return None
+    up = sum(1 for t in trades if str(t.get(field) or "").upper() == "UP")
+    down = sum(1 for t in trades if str(t.get(field) or "").upper() == "DOWN")
+    if up + down == 0:
+        return None
+    return f"UP {up}  DOWN {down}"
 
 
 # ------------------------------------------------------------------ sizing ---
@@ -169,9 +184,18 @@ def L(short: str, long: str, s: Sizing) -> str:
 
 
 def _trade_success(result) -> bool:
-    return str(result or "").lower() not in {
-        "", "rejected_or_unsubmitted", "failed", "rejected",
-    }
+    """Did this journal row actually become a position?
+
+    BUGFIX: the old set listed only the explicit rejections, so every
+    `skipped_*` row - an attempt the bot deliberately did NOT submit, because
+    the leg was unfillable, the signal moved, or the pair would lose - fell
+    through to True and rendered as a green FILL. The band log makes that
+    obvious: a band that never traded would show a column of fills.
+    """
+    outcome = str(result or "").lower()
+    if outcome.startswith("skipped"):
+        return False
+    return outcome not in {"", "rejected_or_unsubmitted", "failed", "rejected"}
 
 
 # ------------------------------------------------------------------ pieces ---
@@ -346,7 +370,17 @@ def _round_panel(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
     d = snap["decision"]
     body.append(kv("CURRENT SIDE", d or MISSING, w,
                    Style("green" if d == "UP" else "red", bold=True) if d else FAINT))
-    body.append(kv("MOMENTUM", MISSING, w, FAINT))
+    mom = snap["sig_price"]
+    binance_move = (spot - snap["start_price"]
+                    if spot is not None and snap["start_price"] is not None else None)
+    if mom and binance_move is not None:
+        mom_txt = f"{mom}  {binance_move:+,.2f}"
+    elif mom:
+        mom_txt = mom
+    else:
+        mom_txt = MISSING
+    body.append(kv("MOMENTUM", mom_txt, w,
+                   Style("green" if mom == "UP" else "red", bold=True) if mom else FAINT))
     details = [item for item in
                list((snap.get("accounting") or {}).get("open_position_details") or [])
                if isinstance(item, Mapping)]
@@ -414,7 +448,8 @@ def _status_strip(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]
         ("SIGNAL", "SIGNAL", agree, "OK" if named else "WAIT"),
         ("GATE", "ENTRY GATE", "ABSENT", "ABSENT"),
         ("SIDE", "SIDE", d or "--", "UP" if d == "UP" else ("DOWN" if d == "DOWN" else "WAIT")),
-        ("MOM", "MOMENTUM", "ABSENT", "ABSENT"),
+        ("MOM", "MOMENTUM", snap["sig_price"] or "--",
+         snap["sig_price"] or "WAIT"),
         ("EDGE", "EDGE", "ABSENT", "ABSENT"),
         ("PAIR", "PAIR COST", "ABSENT", "ABSENT"),
         ("RISK", "RISK", "ABSENT", "ABSENT"),
@@ -657,7 +692,9 @@ def _dist(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
     body.append(kv("CHAINLINK UP SHARE",
                    f"{sum(1 for t in trades if t.get('chainlink_side') == 'UP')}/{len(trades)}"
                    if trades else MISSING, w, Style("amber") if trades else FAINT))
-    body.append(kv("MOMENTUM DIST", MISSING, w, FAINT))
+    mom_dist = _up_down_share(trades, "price_side")
+    body.append(kv("MOMENTUM DIST", mom_dist or MISSING, w,
+                   Style("ink") if mom_dist else FAINT))
     return panel("SIGNAL DISTRIBUTION", body, cols, rows, g, right_note="this round")
 
 
@@ -694,6 +731,64 @@ def _trades(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
                  if snap["mode"] == "PAPER" else "this round | history: ledger")
 
 
+def _band_trades(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
+    """Phase-1 band entries, and nothing else.
+
+    Replaces the old EXITS / STOP panel. Deliberately excludes every phase-2
+    row: the band is a separate entry rule being measured on its own fills,
+    and one table holding both cannot answer "how is the band doing" - the
+    SIDE and RESULT columns would be describing two different strategies at
+    once. The same reasoning the exits panel used for keeping exits out of
+    RECENT TRADES applies here to keeping phase 2 out of the band log.
+    """
+    w = cols - 2
+    body: list[Row] = []
+    bands = snap.get("bands") or ()
+    if not snap.get("bands_enabled"):
+        body.append(pad([(fit("bands are OFF (PHASE1_ENABLED=0)", w, "<"), FAINT)], w))
+    elif not bands:
+        body.append(pad([(fit("no band schedule configured", w, "<"), FAINT)], w))
+    else:
+        for start, end, low, high, gap in bands[:2]:
+            body.append(pad([
+                (fit(f"T-{int(start)}..T-{int(end)}", 13, "<"), DIM),
+                (fit(f"{low:.2f}-{high:.2f}", 10, "<"), Style("ink")),
+                (fit(f"every {gap:.0f}s", 10, "<"), FAINT),
+            ], w))
+        if len(bands) > 2:
+            body.append(pad([
+                (fit(f"+{len(bands) - 2} more windows", w, "<"), FAINT)], w))
+    body.append(pad([(fit("", w, "<"), PAPER)], w))
+
+    hdr = ["TIME", "SIDE", "COST", "SIG", "RESULT"]
+    cw = [8, 5, 6, 4, 7]
+    while sum(cw) + len(cw) > w and len(hdr) > 2:
+        hdr.pop()
+        cw.pop()
+    rows_data = []
+    for t in reversed(snap.get("trades") or []):
+        # Only band. A phase-2 row in here would be exactly the mixing this
+        # panel exists to avoid.
+        if str(t.get("phase") or "") != "phase1":
+            continue
+        ok = _trade_success(t.get("result"))
+        cells = [
+            (str(t.get("time_et", ""))[-11:-3] or "--", DIM),
+            (str(t.get("side", "--")),
+             Style("green" if t.get("side") == "UP" else "red", bold=True)),
+            (f"${(_finite(t.get('amount')) or 0.0):.2f}", Style("ink")),
+            (str(t.get("price_side") or "-")[:2], FAINT),
+            (("FILL" if snap["mode"] == "PAPER" else "SENT") if ok else "REJECT",
+             Style("green" if ok else "red", bold=True)),
+        ]
+        rows_data.append(cells[:len(hdr)])
+    used = len(body)
+    body += table(hdr, cw, rows_data, w, max_rows=max(1, rows - 3 - used))
+    note = (f"{bands[0][2]:.2f}-{bands[0][3]:.2f} | band only"
+            if bands and snap.get("bands_enabled") else "off")
+    return panel("BAND TRADES", body, cols, rows, g, right_note=note)
+
+
 def _events(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
     w = cols - 2
     lv = {"good": Style("green"), "bad": Style("red", bold=True),
@@ -715,7 +810,7 @@ def _events(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
 def _footer(snap, cols: int, g: Glyphs, s: Sizing) -> Row:
     up = snap["uptime"]
     left = [
-        (" q ", Style("white", "ink", bold=True)), (" quit  ", DIM),
+        ("Ctrl+C ", Style("white", "ink", bold=True)), (" quit  ", DIM),
         (" r ", Style("white", "ink", bold=True)), (" repaint  ", DIM),
         (f"up {int(up // 3600):02d}:{int(up % 3600 // 60):02d}:{int(up % 60):02d}  ", DIM),
         (f"frames {snap['frames']}  ", DIM),
@@ -813,10 +908,22 @@ def build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
             w1, w2 = hsplit(cols, [0.5, 0.5], [30, 30])
             frame += join([_trades(snap, w1, s.bot, g, s), _events(snap, w2, s.bot, g, s)],
                           [w1, w2], s.bot)
-        else:
-            w1, w2, w3 = hsplit(cols, [0.26, 0.34, 0.40], [28, 30, 30])
+        elif cols >= 120:
+            w1, w2, w3, w4 = hsplit(cols, [0.20, 0.26, 0.26, 0.28],
+                                    [26, 28, 28, 28])
             frame += join([_dist(snap, w1, s.bot, g, s),
                            _trades(snap, w2, s.bot, g, s),
+                           _band_trades(snap, w3, s.bot, g, s),
+                           _events(snap, w4, s.bot, g, s)],
+                          [w1, w2, w3, w4], s.bot)
+        else:
+            # Narrower than four columns: the exit panel displaces the P&L
+            # histogram rather than the trade or event feeds. A distribution
+            # is a summary you can read after the fact; an unfilled stop is
+            # something you need to see while it is happening.
+            w1, w2, w3 = hsplit(cols, [0.30, 0.30, 0.40], [28, 28, 30])
+            frame += join([_trades(snap, w1, s.bot, g, s),
+                           _band_trades(snap, w2, s.bot, g, s),
                            _events(snap, w3, s.bot, g, s)], [w1, w2, w3], s.bot)
 
     frame.append(_footer(snap, cols, g, s))

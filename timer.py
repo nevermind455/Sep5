@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import requests
+import http_pool
 
 ET = ZoneInfo("America/New_York")
 
@@ -19,22 +19,29 @@ _clock_sample_wall = None
 _clock_sample_mono = None
 
 
-def clock_offset() -> float:
-    with _clock_lock:
-        return _clock_offset
-
-
 def clock_measured() -> bool:
     with _clock_lock:
         return _clock_measured
+
+
+def unix(ts: float | None = None) -> float:
+    """Unshifted Unix time. Round identity and market slugs use this.
+
+    ``wall()`` follows CLOB ``/time`` and is only for exchange-timestamp age.
+    A lagging CLOB clock must not delay 5-minute windows: slugs are
+    ``btc-updown-5m-{unix}`` and Binance trade timestamps are Unix.
+    """
+    if ts is not None:
+        return float(ts)
+    return time.time()
 
 
 def wall(ts: float | None = None) -> float:
     """CLOB-aligned Unix time after a successful ``check_clock``.
 
     Explicit timestamps are returned unchanged so tests and recorded samples
-    stay literal.  Live call sites that need round identity should pass
-    ``timer.wall()``, not ``time.time()``.
+    stay literal. Round identity must use ``timer.unix()`` / ``window_start()``;
+    ``wall()`` is the clock to compare with CLOB-issued timestamps.
     """
     if ts is not None:
         return float(ts)
@@ -88,22 +95,22 @@ def exchange_age_s(ts_ms: int | float) -> float:
 
 
 def now_et(ts: float | None = None):
-    return datetime.fromtimestamp(wall() if ts is None else ts, ET)
+    return datetime.fromtimestamp(unix() if ts is None else ts, ET)
 
 
 def seconds_left(ts: float | None = None):
     """Whole seconds remaining, sampled from the same Unix instant as a round id.
 
     At an exact boundary this intentionally returns 300, never 0.  Callers can
-    pass one wall-clock sample to both this function and ``window_start`` so a
+    pass one Unix sample to both this function and ``window_start`` so a
     boundary cannot split their view across two different rounds.
     """
-    current = int(wall() if ts is None else ts)
+    current = int(unix() if ts is None else ts)
     return 300 - (current % 300)
 
 
 def window_start(ts: float | None = None, window: int = 300) -> int:
-    current = int(wall() if ts is None else ts)
+    current = int(unix() if ts is None else ts)
     return current - current % window
 
 
@@ -149,7 +156,13 @@ def check_clock(host: str, max_drift_s: float = 2.0, *, cache_s: float = 30.0,
     offset = None
     try:
         before = time.time()
-        response = requests.get(f"{host.rstrip('/')}/time", timeout=timeout)
+        # Pooled, like every other venue read. This hits the same host as the
+        # book reads, so on a warm pool it reuses their connection instead of
+        # paying a fresh TCP+TLS handshake - measured on this link at between
+        # 2.3s and 15.8s, against a 30s cache that a trade window regularly
+        # outlives. The handshake also inflated `drift`: it sits inside the
+        # before/after interval this function takes the midpoint of.
+        response = http_pool.get(f"{host.rstrip('/')}/time", timeout=timeout)
         response.raise_for_status()
         after = time.time()
         raw = response.json()

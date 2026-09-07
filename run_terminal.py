@@ -10,7 +10,7 @@ coroutine, the same price_ws.stream_price(), the same decisions. This file
 adds three things and nothing else — read-only probes, a stdout sink, and a
 render task.
 
-Keys:  q quit   r force repaint
+Keys:  Ctrl+C quit   r force repaint
 """
 from __future__ import annotations
 
@@ -146,15 +146,27 @@ async def render_loop(state: TerminalState, stop: threading.Event, keys: Keys,
     g = glyphs()
     hz = HZ
     slow_streak = 0
+    seen_repaints = 0
     with renderer:
         while not stop.is_set():
             t0 = time.perf_counter()
             for ch in keys.pop():
-                if ch in ("q", "Q", "\x03"):
-                    stop.set()
-                    main_bot.stop_event.set()
-                elif ch in ("r", "R", "\x0c"):
+                if ch in ("r", "R", "\x0c"):
                     renderer.repaint()
+
+            # A reconnect (or anything else that may have disturbed the
+            # terminal) asks for one clean full redraw here, on the render
+            # loop's own thread. The renderer paints only changed rows, so a
+            # row corrupted from outside matches _prev and would never be
+            # rewritten on its own. Reading a counter keeps the network side
+            # free of any renderer reference: it raises a number, and the
+            # single render loop decides when to act on it. Geometry is
+            # untouched - only the paint is forced.
+            with state.lock():
+                pending = state.repaint_requests
+            if pending != seen_repaints:
+                seen_repaints = pending
+                renderer.repaint()
 
             snap = snapshot(state, session_trades=main_bot.session_trades)
             if isinstance(renderer, PlainRenderer):
@@ -239,7 +251,5 @@ if __name__ == "__main__":
     args = ap.parse_args()
     if args.selftest:
         selftest()
-    try:
-        asyncio.run(run(paper=not args.live))
-    except KeyboardInterrupt:
-        raise SystemExit(130)
+    from run_feeds import run_quietly
+    raise SystemExit(run_quietly(run(paper=not args.live)))

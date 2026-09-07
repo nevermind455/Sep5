@@ -95,11 +95,26 @@ async def record(interval: float) -> int:
             if new:
                 writer.writeheader()
             while True:
-                now = timer.wall()
+                now = timer.unix()
                 window = timer.window_start(now)
                 secs_left = window + 300 - now
-                tokens = market_discovery.get_tokens_for_current_round(window)
-                spot = await asyncio.to_thread(_binance_spot, session)
+                # A recorder meant to run for days cannot die on one bad
+                # network moment. A gamma ConnectionError ended a run here
+                # after ~250 samples; the loop below only caught
+                # KeyboardInterrupt/CancelledError, so it propagated and the
+                # collection stopped silently. Transient venue failures now
+                # cost one sample, and the next tick retries.
+                try:
+                    tokens = market_discovery.get_tokens_for_current_round(window)
+                except Exception as exc:
+                    print(f"[JOURNAL] discovery skipped "
+                          f"({type(exc).__name__}: {str(exc)[:70]})")
+                    tokens = None
+                try:
+                    spot = await asyncio.to_thread(_binance_spot, session)
+                except Exception as exc:
+                    print(f"[JOURNAL] spot skipped ({type(exc).__name__})")
+                    spot = None
                 # BUGFIX: this used to be an unconditional setdefault, so
                 # starting the recorder mid-round recorded a MID-ROUND price
                 # as that round's strike and every binance-signal call for
@@ -113,10 +128,16 @@ async def record(interval: float) -> int:
                 for stale in [w for w in bn_strike if w < window - 3600]:
                     bn_strike.pop(stale, None)
                 if tokens:
-                    up_ask, up_bid, up_bv, up_av = await asyncio.to_thread(
-                        _book, tokens["up_token_id"])
-                    dn_ask, dn_bid, _bv, _av = await asyncio.to_thread(
-                        _book, tokens["down_token_id"])
+                    try:
+                        up_ask, up_bid, up_bv, up_av = await asyncio.to_thread(
+                            _book, tokens["up_token_id"])
+                        dn_ask, dn_bid, _bv, _av = await asyncio.to_thread(
+                            _book, tokens["down_token_id"])
+                    except Exception as exc:
+                        print(f"[JOURNAL] book skipped "
+                              f"({type(exc).__name__}: {str(exc)[:70]})")
+                        await asyncio.sleep(max(1.0, interval))
+                        continue
                     cl_strike = strike.strike_for(window)
                     cl_now = strike.current_value()
                     writer.writerow({

@@ -230,20 +230,24 @@ def t_strike_memory_is_bounded():
     check("strike map stays bounded", len(s.strikes) <= 200, str(len(s.strikes)))
 
 
-def t_strike_default_window_uses_the_clob_aligned_clock():
+def t_strike_default_window_uses_unix_not_a_lagging_clob_clock():
     import timer
 
     original_wall = timer.wall
+    original_unix = timer.unix
     original_time = strike_mod.time.time
     try:
-        # Local time is still in the previous round while the measured CLOB
-        # clock has crossed the boundary.
+        # CLOB /time has already crossed the boundary; Unix has not.
+        # Round identity must stay on Unix or the displayed round overruns
+        # and the next market opens late.
         strike_mod.time.time = lambda: 1_786_320_299.8
+        timer.unix = lambda *_a, **_k: 1_786_320_299.8
         timer.wall = lambda *_a, **_k: 1_786_320_301.2
-        check("RTDS default window follows CLOB time",
-              window_start() == 1_786_320_300, str(window_start()))
+        check("RTDS default window follows Unix, not CLOB /time",
+              window_start() == 1_786_320_000, str(window_start()))
     finally:
         timer.wall = original_wall
+        timer.unix = original_unix
         strike_mod.time.time = original_time
 
 
@@ -460,11 +464,11 @@ def t_paper_startup_does_not_abort_on_measured_clock_drift():
     check("live mode still fail-closes on unverified clock",
           'if mode == "LIVE":' in source
           and "CLOB clock synchronization could not be verified" in source)
-    check("paper mode continues on CLOB-corrected time",
+    check("paper mode keeps Unix round windows when CLOB drift is large",
           "PAPER continues" in source
-          and "CLOB-corrected time" in source)
-    check("strategy samples CLOB-aligned wall time",
-          "sampled_wall = timer.wall()" in source)
+          and "Unix 5-minute windows" in source)
+    check("strategy samples Unix time for round identity",
+          "sampled_wall = timer.unix()" in source)
 
 
 class _ClockResp:
@@ -482,12 +486,12 @@ def t_clock_offset_aligns_round_identity_to_clob():
     import timer
     timer.reset_clock_cache()
     server_ahead = 2.363
-    orig = timer.requests.get
+    orig = timer.http_pool.get
 
     def fake_get(*_a, **_k):
         return _ClockResp(time.time() + server_ahead)
 
-    timer.requests.get = fake_get
+    timer.http_pool.get = fake_get
     try:
         ok, detail, drift = timer.check_clock("https://clob.example", 2.0, cache_s=0)
         check("measured drift beyond 2s is not within live tolerance",
@@ -499,13 +503,15 @@ def t_clock_offset_aligns_round_identity_to_clob():
         residual = timer.wall() - (time.time() + server_ahead)
         check("wall() tracks CLOB time within a few hundred ms",
               abs(residual) < 0.25, f"{residual:.4f}s")
+        check("window_start ignores CLOB offset and stays on Unix",
+              timer.window_start() == timer.window_start(time.time()))
         explicit = 1_786_320_017.4
         check("explicit timestamps are not shifted",
               timer.window_start(explicit) == 1_786_320_000)
         check("seconds_left uses the supplied sample",
               timer.seconds_left(explicit) == 283)
     finally:
-        timer.requests.get = orig
+        timer.http_pool.get = orig
         timer.reset_clock_cache()
     check("reset clears the measured offset",
           not timer.clock_measured() and timer.clock_offset() == 0.0)
@@ -518,12 +524,12 @@ def t_binance_and_fresh_snapshot_follow_clob_time():
     from feeds.binance import BinanceTradeFeed
 
     timer.reset_clock_cache()
-    orig = timer.requests.get
+    orig = timer.http_pool.get
     orig_price = price_ws.latest_price
     orig_mono = price_ws.latest_price_mono
     orig_ts = price_ws.latest_price_ts_ms
     orig_id = price_ws.latest_trade_id
-    timer.requests.get = lambda *_a, **_k: _ClockResp(time.time() + 3.5)
+    timer.http_pool.get = lambda *_a, **_k: _ClockResp(time.time() + 3.5)
     try:
         timer.check_clock("https://clob.example", 2.0, cache_s=0)
         trade_ms = int(time.time() * 1000) + 3500
@@ -551,7 +557,7 @@ def t_binance_and_fresh_snapshot_follow_clob_time():
         check("fresh_snapshot does not treat CLOB/Binance skew as local staleness",
               fresh_past == 64124.00 and ts_past == past_ms, str((fresh_past, ts_past)))
     finally:
-        timer.requests.get = orig
+        timer.http_pool.get = orig
         timer.reset_clock_cache()
         price_ws.latest_price = orig_price
         price_ws.latest_price_mono = orig_mono
@@ -562,19 +568,19 @@ def t_binance_and_fresh_snapshot_follow_clob_time():
 def t_clock_check_failure_does_not_clear_last_offset():
     import timer
     timer.reset_clock_cache()
-    orig = timer.requests.get
-    timer.requests.get = lambda *_a, **_k: _ClockResp(time.time() + 0.05)
+    orig = timer.http_pool.get
+    timer.http_pool.get = lambda *_a, **_k: _ClockResp(time.time() + 0.05)
     try:
         ok, _detail, drift = timer.check_clock("https://clob.example", 2.0, cache_s=0)
         check("small drift is within tolerance", ok is True, str(drift))
         stored = timer.clock_offset()
-        timer.requests.get = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("down"))
+        timer.http_pool.get = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("down"))
         ok2, detail2, drift2 = timer.check_clock("https://clob.example", 2.0, cache_s=0)
         check("network failure is fail-closed", ok2 is False and drift2 is None, detail2)
         check("last good offset is kept after a failed refresh",
               timer.clock_measured() and abs(timer.clock_offset() - stored) < 1e-9)
     finally:
-        timer.requests.get = orig
+        timer.http_pool.get = orig
         timer.reset_clock_cache()
 
 
@@ -582,14 +588,14 @@ def t_clock_cache_is_invalidated_by_a_local_wall_clock_jump():
     import timer
 
     timer.reset_clock_cache()
-    original = timer.requests.get
+    original = timer.http_pool.get
     calls = []
 
     def fake_get(*_a, **_k):
         calls.append(True)
         return _ClockResp(time.time())
 
-    timer.requests.get = fake_get
+    timer.http_pool.get = fake_get
     try:
         timer.check_clock("https://clob.example", 2.0, cache_s=30)
         timer.check_clock("https://clob.example", 2.0, cache_s=30)
@@ -602,7 +608,7 @@ def t_clock_cache_is_invalidated_by_a_local_wall_clock_jump():
         check("wall-clock jump forces an immediate CLOB recheck",
               len(calls) == 2, str(calls))
     finally:
-        timer.requests.get = original
+        timer.http_pool.get = original
         timer.reset_clock_cache()
 
 
@@ -844,6 +850,7 @@ async def t_transient_unfillable_book_is_retried_next_attempt():
                 lambda: (100.0, time.monotonic(), (active + 1) * 1000))
         replace(main_bot.price_ws, "fresh_snapshot",
                 lambda *_a, **_k: (101.0, (active + 100) * 1000))
+        replace(main_bot.timer, "unix", lambda *_a, **_k: active + 100.0)
         replace(main_bot.timer, "wall", lambda *_a, **_k: active + 100.0)
         replace(main_bot.timer, "check_clock",
                 lambda *_a, **_k: (True, "clock synchronized", 0.0))
@@ -875,7 +882,7 @@ async def _drive_phase1(books, *, remaining=200.0, timeout=1.5,
                         bands=((300, 120, 0.25, 0.50, 12.0),),
                         held_provider=None, exposure_provider=None,
                         execution_mode="PAPER", execution_ready_provider=None,
-                        price_samples=None):
+                        price_samples=None, skip_joined_round=False):
     """Run one phase-1 pass against a fixed pair of books. Returns what it did."""
     import main_bot
 
@@ -912,6 +919,9 @@ async def _drive_phase1(books, *, remaining=200.0, timeout=1.5,
         # the band's ceiling travels with the order as its price cap
         seen["caps"] = seen.get("caps", [])
         seen["caps"].append(kwargs.get("max_price", args[-1] if args else None))
+        # the band's floor travels with it too, or the walk can fill below it
+        seen["floors"] = seen.get("floors", [])
+        seen["floors"].append(kwargs.get("min_price"))
         main_bot.stop_event.set()
         return True
 
@@ -946,6 +956,7 @@ async def _drive_phase1(books, *, remaining=200.0, timeout=1.5,
         replace(main_bot.price_ws, "latest_snapshot",
                 lambda: (100.0, time.monotonic(), (active + 1) * 1000))
         replace(main_bot.price_ws, "fresh_snapshot", fresh_price)
+        replace(main_bot.timer, "unix", lambda *_a, **_k: active + (300.0 - remaining))
         replace(main_bot.timer, "wall", lambda *_a, **_k: active + (300.0 - remaining))
         replace(main_bot.timer, "check_clock",
                 lambda *_a, **_k: (True, "clock synchronized", 0.0))
@@ -956,6 +967,7 @@ async def _drive_phase1(books, *, remaining=200.0, timeout=1.5,
         replace(main_bot.config, "BET_SIZE", 2.50)
         replace(main_bot.config, "MAX_ROUND_EXPOSURE", 100.0)
         replace(main_bot.config, "CANCEL_OPEN_BEFORE_TRADE", False)
+        replace(main_bot.config, "SKIP_JOINED_ROUND", skip_joined_round)
         main_bot.stop_event.clear()
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.suppress(asyncio.TimeoutError):
@@ -976,6 +988,8 @@ def _book(ask):
 async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   execution_ready_provider=None,
                                   timeout=0.55, price_votes=None,
+                                  book_vote="DOWN", chainlink_vote="DOWN",
+                                  minority_rule=False,
                                   diagnostic_side="DOWN",
                                   stop_after_vote=None,
                                   stop_after_orders=1,
@@ -1052,17 +1066,21 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
             "orderbook_token_id": "11", "condition_id": "0x" + "a" * 64,
         })
         replace(main_bot.orderbook, "get_orderbook", lambda *_a, **_k: (bids, asks))
-        replace(main_bot.orderbook, "liquidity_signal", lambda *_a, **_k: "DOWN")
+        replace(main_bot.orderbook, "liquidity_signal",
+                lambda *_a, **_k: book_vote)
         replace(main_bot.orderbook, "validate_buy_liquidity", probe)
         replace(main_bot.strategy, "decide", lambda *_a, **_k: "DOWN")
         replace(main_bot.strategy, "final_decision",
                 lambda *_a, **_k: diagnostic_side)
+        replace(main_bot, "chainlink_signal",
+                lambda *_a, **_k: chainlink_vote)
         if votes:
             replace(main_bot, "price_signal", tagged_price_signal)
         replace(main_bot.price_ws, "latest_snapshot",
                 lambda: (100.0, time.monotonic(), (active + 1) * 1000))
         replace(main_bot.price_ws, "fresh_snapshot",
                 lambda *_a, **_k: (101.0, (active + 100) * 1000))
+        replace(main_bot.timer, "unix", lambda *_a, **_k: active + 100.0)
         replace(main_bot.timer, "wall", lambda *_a, **_k: active + 100.0)
         replace(main_bot.timer, "check_clock",
                 lambda *_a, **_k: (True, "clock synchronized", 0.0))
@@ -1073,6 +1091,7 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
         replace(main_bot.config, "MAX_ROUND_EXPOSURE", 100.0)
         replace(main_bot.config, "CANCEL_OPEN_BEFORE_TRADE", False)
         replace(main_bot.config, "PAPER_ALLOW_SIGNAL_FLIPS", allow_signal_flips)
+        replace(main_bot.config, "SIGNAL_MINORITY_RULE", minority_rule)
         main_bot.stop_event.clear()
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.suppress(asyncio.TimeoutError):
@@ -1083,6 +1102,75 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
             setattr(obj, name, value)
         main_bot.stop_event.clear()
     return seen
+
+
+async def t_phase1_honours_the_joined_round_switch():
+    """SKIP_JOINED_ROUND must stop the BANDS too, not only phase 2.
+
+    The guard used to sit between the two phases, so phase 1 had already
+    `continue`d past it. The round is joined with no opening print, but
+    BOUNDARY_BACKFILL_AFTER recovers that print from REST, and from then on
+    the bands traded a round the operator asked the bot to sit out.
+    """
+    books = {"11": _book(0.60), "12": _book(0.40)}
+    trading = await _drive_phase1(books, remaining=200.0, skip_joined_round=False)
+    check("with the switch off, phase 1 still trades the joined round",
+          trading["orders"] == ["DOWN"], str(trading["orders"]))
+    skipped = await _drive_phase1(books, remaining=200.0, skip_joined_round=True)
+    check("with the switch on, phase 1 sits the joined round out",
+          skipped["orders"] == [], str(skipped["orders"]))
+
+
+async def t_phase1_sends_both_ends_of_its_band_to_the_executor():
+    """A band caps the walk at its top AND its bottom.
+
+    Only the ceiling used to travel with the order. The floor lived in the
+    pre-submit liquidity check alone, and the book moves between that check
+    and the fill, so a leg quoted inside the band could fill below it - at a
+    price the band experiment never meant to measure, in a book that had just
+    moved against the side being bought.
+    """
+    seen = await _drive_phase1({"11": _book(0.60), "12": _book(0.40)},
+                               bands=((300, 120, 0.25, 0.50, 12.0),))
+    check("the order carries its band's ceiling", seen.get("caps") == [0.50],
+          str(seen.get("caps")))
+    check("the order carries its band's floor too", seen.get("floors") == [0.25],
+          str(seen.get("floors")))
+
+
+def t_executor_floor_may_only_rise_never_fall():
+    """`min_price` mirrors `max_price`: it can tighten, never loosen."""
+    import paper_trade
+    from decimal import Decimal as D
+
+    rules = paper_trade.MarketRules(
+        "0x" + "a" * 64, D("0"), D("1"), min_order_size=D("5"),
+        tick_size=D("0.01"), source="test", up_token_id="11", down_token_id="12")
+
+    def book(ask):
+        a = D(str(ask))
+        return paper_trade.BookSnapshot(
+            token_id="11", asks=((a, D("500")),), min_order_size=D("5"),
+            tick_size=D("0.01"), timestamp=0, book_hash="h", received_wall=0.0,
+            best_bid=a - D("0.01"), bids=((a - D("0.01"), D("500")),))
+
+    def fills(ask, floor):
+        try:
+            spend = paper_trade.size_to_venue_minimum(
+                D("2.50"), book(ask), rules, D("0.65"))
+            paper_trade.estimate_fok(book(ask), spend, D("0.65"), rules,
+                                     min_price=floor)
+            return True
+        except paper_trade.PaperRejected:
+            return False
+
+    account_floor = D("0.30")
+    band_floor = max(account_floor, D("0.55"))
+    check("an ask inside the band still fills", fills("0.60", band_floor))
+    check("an ask below the band no longer fills", not fills("0.54", band_floor))
+    check("a floor below the account minimum cannot loosen it",
+          max(account_floor, D("0.10")) == account_floor
+          and not fills("0.20", max(account_floor, D("0.10"))))
 
 
 async def t_phase1_buys_whichever_leg_is_in_the_band():
@@ -1216,6 +1304,28 @@ async def t_phase2_price_signal_is_the_only_order_side_authority():
     check("phase 2 skips stale SIG PRICE immediately before submission",
           submit_stale["orders"] == 0 and submit_stale["price_votes"] >= 3,
           str(submit_stale))
+
+
+async def t_phase2_minority_rule_revalidates_the_deciding_side():
+    """Minority mode must validate its decision, not compare it to SIG PRICE."""
+    stable = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 4, book_vote="UP", chainlink_vote="DOWN",
+        minority_rule=True)
+    check("stable dissenting side reaches the executor",
+          stable["order_sides"] == ["DOWN"], str(stable))
+    check("minority order retains a passing fresh-price commit guard",
+          stable["executor_guards"] == [True], str(stable))
+
+    changed = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        # Initial UP/UP/DOWN chooses DOWN. Once SIG PRICE moves DOWN, the
+        # votes become DOWN/UP/DOWN and the minority decision changes to UP.
+        price_votes=("UP", "DOWN", "DOWN", "DOWN"),
+        book_vote="UP", chainlink_vote="DOWN", minority_rule=True,
+        stop_after_vote=2)
+    check("changed minority decision blocks the stale order side",
+          changed["orders"] == 0, str(changed))
 
 
 async def t_paper_signal_flip_mode_keeps_repeats_and_allows_verified_flip():
@@ -1851,6 +1961,42 @@ def t_ws_book_accepts_a_quiet_resubscribe_snapshot():
     check("an unreadable timestamp is refused", not b._fresh_exchange_ts("abc"))
     check("liveness is still measured from receipt, not event time",
           b.stale_after == 8.0)
+
+
+def t_ctrl_c_is_a_clean_exit_not_a_traceback():
+    """Ctrl+C must leave a quiet 130, not asyncio's Windows teardown dump."""
+    from run_feeds import run_quietly
+
+    async def raise_interrupt():
+        await asyncio.sleep(0)
+        raise KeyboardInterrupt
+
+    async def child_still_running():
+        async def linger():
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                return
+        leftover = asyncio.create_task(linger())
+        await asyncio.sleep(0)
+        raise KeyboardInterrupt
+        leftover.cancel()
+
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        code = run_quietly(raise_interrupt())
+    err = buf.getvalue()
+    check("in-task Ctrl+C is exit 130", code == 130, str(code))
+    check("in-task Ctrl+C prints no traceback",
+          "Traceback" not in err and "KeyboardInterrupt" not in err, err)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        code = run_quietly(child_still_running())
+    err = buf.getvalue()
+    check("Ctrl+C drains leftover tasks", code == 130, str(code))
+    check("Ctrl+C leaves no pending-task warning",
+          "Task was destroyed but it is pending" not in err, err)
 
 
 def main():

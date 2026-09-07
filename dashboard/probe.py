@@ -25,14 +25,48 @@ import threading
 import time
 from pathlib import Path
 
+import logging
+
 from .safety import exception_summary, terminal_text
 from .state import TerminalState
 
 _installed = False
 _orig_stdout = None
+# stdout was captured but stderr never was, so anything the interpreter or a
+# library wrote there - a traceback from a failing feed task, a warning, an
+# asyncio "Task exception was never retrieved" - went straight to the alt
+# screen OUTSIDE the renderer's draw lock and tore the layout apart. A weak
+# network produces mostly that. Captured so it becomes an event row like any
+# other message instead of raw text painted over the frame.
+_orig_stderr = None
+# Python logging is unconfigured in this build, so its lastResort handler
+# writes WARNING+ to stderr - including the traceback from
+# accounting/settlement.py's logger.exception(). Routed into the same sink.
+_log_handler = None
 _originals: dict[tuple[object, str], object] = {}
 _sink = None
 _lifecycle_lock = threading.RLock()
+
+
+class _SinkLogHandler(logging.Handler):
+    """Send log records to the dashboard event ring, never to the screen.
+
+    A handler that raised would be reported by logging on stderr - the very
+    thing this exists to stop - so every failure here is swallowed.
+    """
+
+    def __init__(self, sink) -> None:
+        super().__init__()
+        self._sink = sink
+
+    def emit(self, record) -> None:
+        try:
+            self._sink.write(self.format(record) + chr(10))
+        except Exception:
+            pass
+
+    def handleError(self, record) -> None:
+        return
 
 
 def _telemetry_failed(state: TerminalState, surface: str, exc: Exception) -> None:
@@ -155,7 +189,7 @@ def _parse_round_state(state: TerminalState, tag: str, msg: str) -> None:
                 import timer
 
                 price = _num(m.group(1))
-                bot_round = timer.window_start(timer.wall())
+                bot_round = timer.window_start(timer.unix())
                 state.mark_strategy_round(bot_round)
                 accepted = state.push_price_to_beat(
                     price, source="ROUND log line", round_key=bot_round)
@@ -227,18 +261,27 @@ def _open_private_mirror(path_value: str):
 
 def install(state: TerminalState, mirror_path: str | None = None):
     """Atomically install probes; roll back every side effect on failure."""
-    global _installed, _orig_stdout, _sink
+    global _installed, _orig_stdout, _orig_stderr, _log_handler, _sink
     with _lifecycle_lock:
         try:
             return _install_locked(state, mirror_path)
         except Exception as exc:
             failures = _restore_patches()
+            if _log_handler is not None:
+                try:
+                    logging.getLogger().removeHandler(_log_handler)
+                except Exception:
+                    pass
+                _log_handler = None
             if _sink is not None:
                 if sys.stdout is _sink and _orig_stdout is not None:
                     sys.stdout = _orig_stdout
+                if sys.stderr is _sink and _orig_stderr is not None:
+                    sys.stderr = _orig_stderr
                 _sink.finish()
             _sink = None
             _orig_stdout = None
+            _orig_stderr = None
             _installed = False
             state.event("DASH", f"probe install rolled back: {exception_summary(exc)}", "bad")
             for failure in failures:
@@ -248,7 +291,7 @@ def install(state: TerminalState, mirror_path: str | None = None):
 
 def _install_locked(state: TerminalState, mirror_path: str | None = None):
     """Install probes. Returns the saved real stdout for the renderer."""
-    global _installed, _orig_stdout, _sink
+    global _installed, _orig_stdout, _orig_stderr, _log_handler, _sink
     if _installed:
         if _sink is not None and _sink.state is not state:
             raise RuntimeError("dashboard probes are already attached to another state")
@@ -268,6 +311,14 @@ def _install_locked(state: TerminalState, mirror_path: str | None = None):
         state.trade_window = config.TRADE_LAST_SECONDS
         state.max_buy_price = config.MAX_BUY_PRICE
         state.min_buy_price = config.MIN_BUY_PRICE
+        state.bands_enabled = bool(config.PHASE1_ENABLED)
+        # Resolve each band's cadence here: a band that set no interval of its
+        # own uses PHASE1_INTERVAL_SECONDS, and the layout must not have to
+        # know that rule (or import config) to render it.
+        state.bands = tuple(
+            (start, end, low, high,
+             config.PHASE1_INTERVAL_SECONDS if interval is None else interval)
+            for start, end, low, high, interval in config.PHASE1_BANDS)
         state.mode = str(getattr(main_bot, "execution_mode", "LIVE") or "LIVE").upper()
 
     # ---- orderbook -------------------------------------------------------
@@ -308,6 +359,18 @@ def _install_locked(state: TerminalState, mirror_path: str | None = None):
             try:
                 with state.lock():
                     if state.round_key is not None and round_key == state.round_key:
+                        # BUGFIX: strategy_round_key used to be set ONLY when a
+                        # "[ROUND] Chainlink 60s TWAP" line was parsed, and
+                        # sig_book/decision are gated on it. With no live
+                        # Chainlink feed that line never prints, so the book
+                        # signal and FINAL DECISION showed "--" all round while
+                        # the bot was demonstrably computing them (the event log
+                        # read "price=UP book=UP chainlink=..."). The book signal
+                        # does not depend on Chainlink and must not be hidden by
+                        # its absence. main_bot passes its own latched round here
+                        # and it is already confirmed equal to round_key above,
+                        # which is exactly what the tag is meant to record.
+                        state.mark_strategy_round(round_key)
                         if start is not None:
                             state.start_price.set(
                                 start, source="main_bot.price_signal arg")
@@ -457,22 +520,56 @@ def _install_locked(state: TerminalState, mirror_path: str | None = None):
     mirror = _open_private_mirror(mirror_path) if mirror_path else None
     _sink = EventSink(state, mirror)
     sys.stdout = _sink
+    # Same sink for stderr: a traceback is a message, not screen geometry.
+    _orig_stderr = sys.stderr
+    sys.stderr = _sink
+    # And for logging, whose lastResort handler would otherwise paint
+    # WARNING+ straight onto the alt screen.
+    _log_handler = _SinkLogHandler(_sink)
+    _log_handler.setFormatter(logging.Formatter("[LOG] %(name)s: %(message)s"))
+    logging.getLogger().addHandler(_log_handler)
     _installed = True
     return _orig_stdout
 
 
+def request_repaint(why: str = "") -> bool:
+    """Ask the dashboard for one clean full redraw, if one is running.
+
+    Safe to call from any feed/receive path: it takes no renderer reference,
+    touches no geometry, and is a no-op when no dashboard is installed (the
+    headless and test paths). Never raises into a network callback.
+    """
+    sink = _sink
+    if sink is None:
+        return False
+    try:
+        sink.state.request_repaint(why)
+        return True
+    except Exception:
+        return False
+
+
 def uninstall() -> None:
     """Restore every patched attribute and stdout. Used by the tests."""
-    global _installed, _orig_stdout, _sink
+    global _installed, _orig_stdout, _orig_stderr, _log_handler, _sink
     with _lifecycle_lock:
         state = _sink.state if _sink is not None else None
         failures = _restore_patches()
+        if _log_handler is not None:
+            try:
+                logging.getLogger().removeHandler(_log_handler)
+            except Exception:
+                pass
+            _log_handler = None
         if _sink is not None:
             if sys.stdout is _sink and _orig_stdout is not None:
                 sys.stdout = _orig_stdout
+            if sys.stderr is _sink and _orig_stderr is not None:
+                sys.stderr = _orig_stderr
             _sink.finish()
         _sink = None
         _orig_stdout = None
+        _orig_stderr = None
         _installed = False
         if state is not None:
             for failure in failures:

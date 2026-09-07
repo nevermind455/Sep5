@@ -47,19 +47,21 @@ TWAP_WINDOW = 60
 RAW_TOPIC = "crypto_prices_twap_sixty"
 SDK_TOPIC = "prices.crypto.chainlink.twap"
 PING_EVERY = 5.0
+# How long an unanswered PING may stand before the socket is treated as
+# dead. RTDS publishes every second and answers PING within one round
+# trip, so silence this long is pathological, never quiet.
+PONG_TIMEOUT = 5.0
 STALE_AFTER = 20.0
 E18 = Decimal(10) ** 18
 
 
 def window_start(ts: float | None = None, window: int = WINDOW) -> int:
-    # Round identity must use the same CLOB-corrected clock as discovery,
-    # execution and the Binance feed.  A machine a few seconds fast/slow can
-    # otherwise mark a connection as belonging to the wrong five-minute
-    # window and either discard the real boundary observation or accept one
-    # from a connection opened after the boundary.
+    # Round identity must use Unix, the same clock as discovery, market slugs,
+    # and Binance trade timestamps. CLOB ``/time`` can lag; using it here
+    # made the current round overrun and the next one open late.
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
         raise ValueError("window must be a positive integer")
-    t = int(timer.wall() if ts is None else ts)
+    t = int(timer.unix() if ts is None else ts)
     return t - (t % window)
 
 
@@ -96,6 +98,8 @@ class ChainlinkStrike:
         self.event_callback_errors = 0
         self.invalid_messages = 0
         self._connection_window: int | None = None
+        self.pong_at: float | None = None
+        self._pong_event = asyncio.Event()
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
 
@@ -214,6 +218,10 @@ class ChainlinkStrike:
             self._connection_window = window_start()
             self.connected = True
             self.last_error = None
+            # A disconnect between PING and PONG must not poison the next
+            # socket into failing its first heartbeat.
+            self.pong_at = time.monotonic()
+            self._pong_event.set()
             await ws.send(json.dumps({
                 "action": "subscribe",
                 "subscriptions": [
@@ -244,10 +252,30 @@ class ChainlinkStrike:
                 self.value_mono = None
 
     async def _ping(self, ws) -> None:
+        """Send PING and require an answer.
+
+        Sending alone proves nothing: a half-open socket accepts writes into a
+        vanished peer indefinitely, and the only other thing that would notice
+        is the 30s receive timeout - six times the TWAP's own staleness bound,
+        so SIG CHAINLINK is dead for the whole of it. Requiring the PONG turns
+        that into roughly PING_EVERY + PONG_TIMEOUT.
+        """
         while True:
             await asyncio.sleep(PING_EVERY)
             try:
+                self._pong_event.clear()
                 await ws.send("PING")
+                await asyncio.wait_for(self._pong_event.wait(),
+                                       timeout=PONG_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                self.last_error = "heartbeat response timeout"
+                try:
+                    await ws.close(code=1011, reason="heartbeat response timeout")
+                except Exception as close_exc:
+                    self.last_error = f"heartbeat close failed: {type(close_exc).__name__}"
+                return
             except Exception as exc:
                 self.last_error = f"heartbeat send failed: {type(exc).__name__}"
                 try:
@@ -270,6 +298,9 @@ class ChainlinkStrike:
             self._reject(f"non-text frame ({type(raw).__name__})")
             return
         if raw.strip().upper() == "PONG":
+            # The heartbeat's only evidence that the peer is still there.
+            self.pong_at = time.monotonic()
+            self._pong_event.set()
             return
         try:
             msg = json.loads(raw)

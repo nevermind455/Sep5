@@ -188,9 +188,6 @@ def get_orderbook(token_id, timeout=8.0):
             # Stamp arrival before any parsing, so `held` measures the age of
             # the data we hold rather than however long decoding took.
             received_at = timer.wall()
-            status = int(getattr(resp, "status_code", 200) or 0)
-            if status == 429 or 500 <= status <= 599:
-                resp.raise_for_status()
             resp.raise_for_status()
             return parse_orderbook(resp.json(), token, received_at=received_at)
         except (requests.Timeout, requests.ConnectionError) as exc:
@@ -237,8 +234,18 @@ def liquidity_signal(bids, asks):
     return "UP" if bid_volume >= ask_volume else "DOWN"
 
 
-def validate_buy_liquidity(token_id, amount, max_price, max_spread, min_price=0.0):
-    """Fail closed before signing when the selected token is unfillable/unsafe."""
+def validate_buy_liquidity(token_id, amount, max_price, max_spread, min_price=0.0,
+                           book=None):
+    """Fail closed before signing when the selected token is unfillable/unsafe.
+
+    `book` is an already-fetched (bids, asks) for THIS token. The caller has
+    usually just read it for the final-validation liquidity signal, and a
+    second fetch of the same leg costs a full venue round trip (measured
+    371-763ms) for a book that cannot have moved in the microseconds since.
+    The caller owns freshness: it must not pass a book read for a different
+    token, nor one that predates blocking work. None keeps the old behaviour
+    of fetching here.
+    """
     amount = _number("amount", amount, minimum=0)
     max_price = _number("max_price", max_price, minimum=0, maximum=1)
     min_price = _number(
@@ -246,7 +253,7 @@ def validate_buy_liquidity(token_id, amount, max_price, max_spread, min_price=0.
     max_spread = _number("max_spread", max_spread, minimum=0, maximum=1)
     if min_price >= max_price:
         raise ValueError("min_price must be below max_price")
-    bids, asks = get_orderbook(token_id)
+    bids, asks = get_orderbook(token_id) if book is None else book
     if not asks:
         raise ValueError("selected token has no asks")
     best_ask = float(asks[0]["price"])

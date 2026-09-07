@@ -1,7 +1,16 @@
 import math
 
 
-def decide(start_price, current_price):
+def decide(start_price, current_price, min_move_bps=0.0):
+    """Direction of the move from the round's open, or None.
+
+    `min_move_bps` is the momentum gate: the move must be at least this many
+    basis points of the opening price before it votes at all. Without it a
+    $0.01 drift on a $79,000 print is a full-confidence UP, indistinguishable
+    from a $200 run - the direction is recorded either way, so a marginal
+    move buys at the same price as a decisive one. 0.0 keeps the historical
+    behaviour exactly: any non-zero move votes.
+    """
     if start_price is None or current_price is None:
         return None
     # Equality is not evidence for either outcome.  The old >= comparison
@@ -15,6 +24,19 @@ def decide(start_price, current_price):
                 return None
         except TypeError:
             pass
+    try:
+        gate = float(min_move_bps)
+    except (TypeError, ValueError):
+        gate = 0.0
+    if gate > 0.0:
+        try:
+            move_bps = abs(current_price - start_price) / abs(start_price) * 10_000.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            # A gate that cannot be evaluated must not silently pass the
+            # trade through as if it had cleared one.
+            return None
+        if not math.isfinite(move_bps) or move_bps < gate:
+            return None
     return "UP" if current_price >= start_price else "DOWN"
 
 
@@ -24,3 +46,30 @@ def final_decision(price_side, book_side, chainlink_side):
     if chainlink_side and chainlink_side in (price_side, book_side):
         return chainlink_side
     return price_side or book_side or chainlink_side
+
+
+def minority_decision(price_side, book_side, chainlink_side):
+    """Follow the DISSENTING signal when the three disagree.
+
+    Two votes for UP and one for DOWN selects DOWN. Unanimity selects the
+    agreed side, because there is no dissent to follow. Neutral or missing
+    signals do not vote: a signal that abstained has not disagreed with
+    anything, and treating silence as dissent would invent a direction.
+
+    A 1-1 split has no minority, so it returns None and the caller abstains
+    rather than breaking the tie arbitrarily.
+    """
+    votes = [s for s in (price_side, book_side, chainlink_side)
+             if s in ("UP", "DOWN")]
+    if not votes:
+        return None
+    if len(set(votes)) == 1:
+        # Unanimous (including a lone vote): nobody dissented, so the agreed
+        # side stands. Without this the majority test below inverts a clean
+        # 3-0 into its opposite.
+        return votes[0]
+    up = votes.count("UP")
+    down = len(votes) - up
+    if up == down:
+        return None
+    return "DOWN" if up > down else "UP"

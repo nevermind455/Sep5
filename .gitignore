@@ -68,3 +68,24 @@ live_diagnostics.log
 # record, and not something a public repo should carry.
 *_decisions.csv
 live_activity.json
+
+# Working data dumps: real positions, PnL and account activity.
+# pos.json carries avgPrice/cashPnl/currentValue/entryFeesUsdc for live
+# positions and act.json ~3k activity records, so a plain `git add -A`
+# would publish the account. Ignored by name rather than left merely
+# unadded.
+pos.json
+act.json
+mkt.json
+all_mkts.json
+_ledgers.json
+_sig.json
+.test-tmp/
+
+# Active paper/live state (the multi_* profile) and the signal journal.
+multi_*.json
+multi_*.csv
+multi_*.jsonl
+live_ledger.json
+signal_journal*.csv
+signal_journal*.json

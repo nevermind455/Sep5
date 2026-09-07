@@ -33,6 +33,22 @@ def main() -> int:
     print("LIVE PREFLIGHT - every gate an order must clear")
     print("=" * 74)
 
+    # 0. name resolution ---------------------------------------------------
+    # Ahead of the credential gate on purpose: when DNS is redirected every
+    # gate below fails with a transport error that looks like a venue problem.
+    try:
+        import http_pool
+        dns_status, dns_detail = http_pool.dns_redirect_report()
+    except Exception as exc:
+        dns_status, dns_detail = "unknown", f"check failed ({type(exc).__name__})"
+    if dns_status == "redirected":
+        line(BAD, "dns resolution", dns_detail)
+        failures += 1
+    elif dns_status == "ok":
+        line(OK, "dns resolution", dns_detail)
+    else:
+        line(WARN, "dns resolution", dns_detail)
+
     # 1. credentials -------------------------------------------------------
     missing = [k for k in ("POLY_PRIVATE_KEY", "POLY_FUNDER", "POLY_SIGNATURE_TYPE")
                if not (os.environ.get(k) or "").strip()]
@@ -52,7 +68,7 @@ def main() -> int:
         failures += 1
 
     # 3. market discovery --------------------------------------------------
-    window = timer.window_start(timer.wall())
+    window = timer.window_start(timer.unix())
     tokens = market_discovery.get_tokens_for_current_round(window)
     if not tokens:
         line(BAD, "market discovery", "no market for the current round")
@@ -67,7 +83,7 @@ def main() -> int:
                              timeout=10).json()
         itode = bool(info.get("itode"))
         assumed = float(config.ASSUMED_MATCH_DELAY_SECONDS)
-        remaining = timer.seconds_left(timer.wall())
+        remaining = timer.seconds_left(timer.unix())
         if not itode:
             line(OK, "matching delay", "venue reports no taker delay")
         elif assumed <= 0:
