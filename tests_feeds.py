@@ -1445,14 +1445,13 @@ TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook
                  "chainlink.py", "market_discovery.py", "price_ws.py", "timer.py",
                  "config.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
-    # Re-approved 2026-09-07: recovery leg needed a named exception to the
-    # account price floor. MIN_BUY_PRICE (0.30 here) is applied inside
-    # _place_trade and is raise-only, so a recovery cap of 0.20 put the floor
-    # ABOVE the cap and every order raised "floor above cap" - the feature was
-    # silently inert. below_account_floor=True is that exception, off by
-    # default, asked for by name. MIN_BUY_PRICE still guards normal entries;
-    # it exists to stop ENTRIES buying lottery tickets, and a recovery leg is
-    # not an entry.
+    # Re-approved 2026-09-07. below_account_floor now exists on BOTH execution
+    # paths. PaperBroker.place_trade is a separate implementation bound over
+    # main_bot.place_trade in paper mode, so the live-only version crashed the
+    # bot with TypeError on the first recovery attempt, and its own
+    # place_trade/_place_trade split meant the flag had to be forwarded as
+    # well as accepted. Paper must honour the same exception or paper results
+    # would misdescribe live.
     "main_bot.py": "b6abe7796be46aa1391a720ff05306b90b0fda69f57dd8f8990789472dfd6dbe",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "33dd2024bdaeace46aefb9d6da561e8f989ec767ebdda8083ec6ed84295048c3",

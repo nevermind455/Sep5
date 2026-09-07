@@ -990,7 +990,8 @@ class PaperBroker:
                     window_end: float | None = None,
                     max_price: float | None = None,
                     min_price: float | None = None, *,
-                    pre_submit_guard=None) -> bool:
+                    pre_submit_guard=None,
+                    below_account_floor: bool = False) -> bool:
         """Run one simulated FOK; reject concurrent duplicate submissions.
 
         `max_price` caps this order only. A caller trading a price band needs
@@ -1009,7 +1010,8 @@ class PaperBroker:
             return self._place_trade(side, amount, up_token_id, down_token_id,
                                      condition_id, window_end, max_price,
                                      min_price,
-                                     pre_submit_guard=pre_submit_guard)
+                                     pre_submit_guard=pre_submit_guard,
+                                     below_account_floor=below_account_floor)
         finally:
             self._execution_lock.release()
 
@@ -1020,7 +1022,8 @@ class PaperBroker:
                      window_end: float | None = None,
                      max_price: float | None = None,
                      min_price: float | None = None, *,
-                     pre_submit_guard=None) -> bool:
+                     pre_submit_guard=None,
+                     below_account_floor: bool = False) -> bool:
         side = str(side or "").upper()
         if side not in ("UP", "DOWN"):
             return self._reject(side, amount, "invalid side")
@@ -1104,7 +1107,7 @@ class PaperBroker:
             cap = self.max_buy_price
             if max_price is not None:
                 cap = min(cap, float(max_price))
-                if cap <= self.min_buy_price:
+                if cap <= self.min_buy_price and not below_account_floor:
                     raise PaperRejected(
                         f"order price cap {cap} is at or below the floor "
                         f"{self.min_buy_price}")
@@ -1114,7 +1117,11 @@ class PaperBroker:
                     f"[PAPER] Sizing ${float(amount):.2f} up to ${float(spend):.2f} "
                     f"to meet the venue minimum"
                 )
-            floor = self.min_buy_price
+            # Mirrors polymarket_trade: MIN_BUY_PRICE guards ENTRIES from
+            # paying for lottery tickets, and a recovery leg is not an entry.
+            # Paper has to honour the same exception or it rejects what live
+            # would accept, which makes paper results a lie about live.
+            floor = Decimal("0") if below_account_floor else self.min_buy_price
             if min_price is not None:
                 # Raise only, mirroring the cap's tighten-only rule.
                 floor = max(floor, Decimal(str(min_price)))

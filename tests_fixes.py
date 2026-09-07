@@ -2147,6 +2147,27 @@ def t_recovery_leg_clears_the_account_price_floor():
           .parameters["below_account_floor"].default is False, "")
 
 
+def t_every_execution_path_accepts_the_floor_exception():
+    """PAPER and LIVE must agree, or paper results lie about live.
+
+    The recovery leg passes below_account_floor. PaperBroker.place_trade is
+    a SEPARATE implementation bound over main_bot.place_trade in paper mode,
+    and it raised TypeError on the unexpected keyword - crashing the bot on
+    the first recovery attempt. A signature-only check is enough to catch
+    that class of break and costs nothing.
+    """
+    import paper_trade
+    import polymarket_trade
+    for label, fn in (("polymarket_trade.place_trade", polymarket_trade.place_trade),
+                      ("PaperBroker.place_trade", paper_trade.PaperBroker.place_trade)):
+        params = inspect.signature(fn).parameters
+        check(f"{label} accepts below_account_floor",
+              "below_account_floor" in params, str(list(params)))
+        check(f"{label} defaults it to False",
+              params.get("below_account_floor") is not None
+              and params["below_account_floor"].default is False, "")
+
+
 def main():
     # A crashing test must be one failure, not a suite that stops reporting.
     def run(fn, is_async=False):
