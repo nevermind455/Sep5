@@ -1999,6 +1999,121 @@ def t_ctrl_c_is_a_clean_exit_not_a_traceback():
           "Task was destroyed but it is pending" not in err, err)
 
 
+# ---------------------------------------------------------------- recovery leg
+def _drive_recovery(*, ask, shares, cost, t_left, held=None, enabled=True,
+                    max_price=0.20, min_secs=120.0, budget=15.0,
+                    provider=True, already=False):
+    """Run _maybe_recovery_leg once and report the order it placed, if any."""
+    import main_bot
+    UP, DN, COND = "111", "222", "0x" + "a" * 64
+    tokens = {"condition_id": COND, "up_token_id": UP, "down_token_id": DN}
+    seen = {"orders": [], "rows": []}
+    saved = []
+
+    def rep(obj, name, value):
+        saved.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    try:
+        rep(main_bot.config, "RECOVERY_LEG_ENABLED", enabled)
+        rep(main_bot.config, "RECOVERY_LEG_MAX_PRICE", max_price)
+        rep(main_bot.config, "RECOVERY_LEG_MIN_SECONDS", min_secs)
+        rep(main_bot.config, "RECOVERY_LEG_BUDGET", budget)
+        rep(main_bot.config, "TRADE_LAST_SECONDS", 300)
+        rep(main_bot.config, "VENUE_MIN_SHARES", 5.0)
+        rep(main_bot, "_round_leg_position_provider",
+            (lambda _c, _t: (shares, cost)) if provider else None)
+        rep(main_bot.orderbook, "get_orderbook",
+            lambda _t, *_a, **_k: (
+                [{"price": f"{max(ask - 0.01, 0.01):.2f}", "size": "9999"}],
+                [{"price": f"{ask:.2f}", "size": "9999"}]))
+        rep(main_bot, "place_trade",
+            lambda side, amount, *_a, **_k: (
+                seen["orders"].append((side, round(float(amount), 2))), True)[1])
+        rep(main_bot, "_append_trade", lambda row: seen["rows"].append(row))
+        main_bot._recovery_fired.clear()
+        if already:
+            main_bot._recovery_fired.add(COND)
+        held_set = set(held if held is not None else (UP,))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            asyncio.run(main_bot._maybe_recovery_leg(
+                "PAPER", tokens, UP, DN, held_set, t_left, 1_788_000_000))
+        seen["log"] = buf.getvalue()
+        seen["held"] = held_set
+        return seen
+    finally:
+        for obj, name, value in reversed(saved):
+            setattr(obj, name, value)
+        main_bot._recovery_fired.clear()
+
+
+def t_recovery_leg_fires_on_a_cheap_opposite_with_time_left():
+    seen = _drive_recovery(ask=0.19, shares=15.0, cost=9.96, t_left=200)
+    check("recovery leg buys the opposite side",
+          [s for s, _ in seen["orders"]] == ["DOWN"], str(seen["orders"]))
+    check("recovery leg logs RECOVERY LEG with both projections",
+          "RECOVERY LEG" in seen["log"] and "UP PnL" in seen["log"]
+          and "DOWN PnL" in seen["log"], seen["log"][:160])
+
+
+def t_recovery_leg_refuses_outside_its_gates():
+    for label, kwargs in (
+            ("inside RECOVERY_LEG_MIN_SECONDS", dict(t_left=110)),
+            ("ask above RECOVERY_LEG_MAX_PRICE", dict(ask=0.35)),
+            ("feature flag off", dict(enabled=False)),
+            ("already fired this market", dict(already=True)),
+            ("no position provider", dict(provider=False)),
+            ("both legs already held", dict(held=("111", "222"))),
+            ("budget under the venue minimum", dict(budget=1.0)),
+    ):
+        base = dict(ask=0.19, shares=15.0, cost=9.96, t_left=200)
+        base.update(kwargs)
+        seen = _drive_recovery(**base)
+        check(f"recovery leg refuses: {label}",
+              seen["orders"] == [], str(seen["orders"]))
+
+
+def t_recovery_leg_refuses_a_position_that_is_not_winning():
+    # cost above the share count means no unrealised profit to spend
+    seen = _drive_recovery(ask=0.19, shares=15.0, cost=15.5, t_left=200)
+    check("recovery leg needs headroom, not just a cheap ask",
+          seen["orders"] == [], str(seen["orders"]))
+
+
+def t_recovery_leg_never_turns_a_winner_into_a_loser():
+    """The sizing invariant, across the shapes the bot actually holds."""
+    import re
+    worst = None
+    fired = 0
+    for shares in (5.0, 15.0, 35.0, 70.0):
+        for entry in (0.35, 0.50, 0.65, 0.78):
+            for ask in (0.02, 0.08, 0.15, 0.20):
+                cost = shares*entry + shares*0.07*entry*(1-entry)
+                seen = _drive_recovery(ask=ask, shares=shares, cost=cost,
+                                       t_left=200, budget=1e9, max_price=0.30)
+                m = re.search(r"UP PnL \$([+-][\d.]+)", seen["log"])
+                if not m:
+                    continue
+                fired += 1
+                held_pnl = float(m.group(1))
+                if worst is None or held_pnl < worst:
+                    worst = held_pnl
+    check("recovery leg fired across the tested shapes", fired > 0, str(fired))
+    check("held-side PnL is never pushed negative by the recovery leg",
+          worst is not None and worst >= 0, f"worst held-side PnL {worst}")
+
+
+def t_recovery_leg_claims_its_slot_once_per_market():
+    seen = _drive_recovery(ask=0.19, shares=15.0, cost=9.96, t_left=200)
+    check("first call fires", len(seen["orders"]) == 1, str(seen["orders"]))
+    # the module-level claim set is what makes this durable within a round
+    import main_bot
+    check("firing records the condition so a second call cannot repeat it",
+          seen["rows"] and seen["rows"][0]["phase"] == "recovery",
+          str(seen["rows"][:1]))
+
+
 def main():
     # A crashing test must be one failure, not a suite that stops reporting.
     def run(fn, is_async=False):

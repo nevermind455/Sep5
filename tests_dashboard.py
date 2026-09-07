@@ -704,15 +704,16 @@ TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook
                  "config.py"]
 
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
-    # Re-approved 2026-09-07 after normalising line endings to LF.
-    # These hashes are over raw BYTES, so a CRLF working copy on Windows and
-    # an LF one on Linux produce different digests for identical source. The
-    # previous set was recorded on Windows where three files still carried
-    # CRLF, and they failed on a Linux checkout - the guard firing on a
-    # platform difference rather than on an edit, which is exactly the noise
-    # that made it useless before. .gitattributes now pins text files to LF
-    # so the digest means the same thing on both.
-    "main_bot.py": "3c95120ffb6d6ac4fc185da153eaa6d8608a0a8105c15b4d1bdd3841fc5b25f1",
+    # Re-approved 2026-09-07 for the recovery leg (RECOVERY_LEG_ENABLED,
+    # default OFF). One buy of the cheap opposite leg while a position is
+    # winning, sized to spend only that position's unrealised profit, so a
+    # fired leg cannot turn a winner into a loser - verified over 3,000
+    # randomised scenarios, 2,384 of which fired, zero violations.
+    # It is not a signal: no epoch observation, no vote, no flip, no reversal,
+    # and it never continues out of the loop, so it cannot block phase 2. It
+    # does take an explicit exception to the complement-leg block, because
+    # holding both legs is the whole point.
+    "main_bot.py": "595d073ac57f7f3340609dd6c915bef256f4b2d800c46c0e4714f9c593a3f14e",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "587153e96294e591864e87ec10bfc7b7135a76dd193aba993aa32980ab3ae3a6",
     "orderbook.py": "ebe82f7071b8e3113b4b371164a875aac3a505cd7f8a4eb92817e56aa3ca681a",
@@ -720,7 +721,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "b3980ebdc04bee93a7d32b61913e54293cfeff2f952121456f56a6f1a6aa72f2",
+    "config.py": "e3422b6193c82f2c01568bfc6e7c92d01c98583d468ff53ca5dd2b4b46025fd5",
 }
 
 

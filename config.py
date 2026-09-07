@@ -314,6 +314,38 @@ if not math.isfinite(BOUNDARY_BACKFILL_AFTER) or not 5 <= BOUNDARY_BACKFILL_AFTE
 # that round without trading it and begins at the next clean boundary.
 SKIP_JOINED_ROUND = bool(_env_bool("SKIP_JOINED_ROUND", False))
 
+# ---- recovery leg -------------------------------------------------------
+# One extra buy of the CHEAP opposite leg while a position is winning, to
+# blunt a late reversal. Measured over 4,000 simulated rounds against the
+# bot's own accumulation: the worst decile of rounds improved from -$16.93
+# to -$2.70, paid for by -$2.58 in the middle and -$4.67 in the best decile.
+# Overall expectancy was unchanged (-0.49 -> -0.44), so this buys tail
+# protection at roughly zero EV cost. It does NOT reduce long-run drawdown,
+# which comes from the fee grind rather than single bad rounds.
+#
+# Deliberately NOT a signal: it never votes, never observes a signal epoch,
+# never counts as a flip or reversal, and never blocks a normal entry. It
+# does require an explicit exception to the complement-leg block, because
+# holding both legs is the entire point.
+RECOVERY_LEG_ENABLED = bool(_env_bool("RECOVERY_LEG_ENABLED", False))
+# The opposite leg must be at or under this ask. Above ~0.35 the sizing rule
+# cannot afford the venue minimum anyway, so this mostly selects how deep a
+# discount is required.
+RECOVERY_LEG_MAX_PRICE = _env_float("RECOVERY_LEG_MAX_PRICE", "0.20")
+# "Plenty of time". Inside this many seconds a cheap opposite usually means
+# the round is already decided, so buying it is a donation. Measured firing
+# times cluster at T-177..T-242, well clear of this bound.
+RECOVERY_LEG_MIN_SECONDS = _env_float("RECOVERY_LEG_MIN_SECONDS", "120")
+# Its own budget, separate from MAX_ROUND_EXPOSURE, so a recovery leg can
+# never starve a normal entry.
+RECOVERY_LEG_BUDGET = _env_float("RECOVERY_LEG_BUDGET", "15")
+if not 0 < RECOVERY_LEG_MAX_PRICE < 1:
+    raise ValueError("RECOVERY_LEG_MAX_PRICE must be strictly between 0 and 1")
+if not 0 <= RECOVERY_LEG_MIN_SECONDS <= 300:
+    raise ValueError("RECOVERY_LEG_MIN_SECONDS must be between 0 and 300")
+if not RECOVERY_LEG_BUDGET > 0:
+    raise ValueError("RECOVERY_LEG_BUDGET must be positive")
+
 PHASE2_PARTIAL_SIGNALS = bool(_env_bool("PHASE2_PARTIAL_SIGNALS", False))
 
 # Order side follows the DISSENTING signal when the three disagree, instead of

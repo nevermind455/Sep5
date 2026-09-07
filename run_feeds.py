@@ -675,6 +675,11 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         # Left unset for LIVE, which keeps the pair-lock closed there.
         main_bot._round_leg_basis_provider = (
             lambda condition, token: ledger.open_leg_basis(condition, token))
+        # Recovery-leg sizing needs shares and sunk cash, not price basis.
+        # Confirmed positions only, so an unfilled authorization can never be
+        # mistaken for headroom to spend.
+        main_bot._round_leg_position_provider = (
+            lambda condition, token: ledger.open_leg_position(condition, token))
     else:
         import polymarket_trade
         # Live exits arrive on the private fill stream like any other fill.
@@ -712,6 +717,11 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         # a pair whose first half never existed.
         main_bot._round_leg_basis_provider = (
             lambda condition, token: ledger.open_leg_basis(condition, token))
+        # Recovery-leg sizing needs shares and sunk cash, not price basis.
+        # Confirmed positions only, so an unfilled authorization can never be
+        # mistaken for headroom to spend.
+        main_bot._round_leg_position_provider = (
+            lambda condition, token: ledger.open_leg_position(condition, token))
         main_bot._execution_ready_provider = hub.user.ready_for_market
 
     # Prove the accounting directory is writable before any feed or order task
@@ -852,6 +862,7 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         main_bot._round_exposure_provider = None
         main_bot._round_held_tokens_provider = None
         main_bot._round_leg_basis_provider = None
+        main_bot._round_leg_position_provider = None
         main_bot._execution_ready_provider = None
         main_bot._accounting_enabled = False
         main_bot._strike = None

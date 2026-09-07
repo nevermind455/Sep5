@@ -302,6 +302,33 @@ class Ledger:
                 return float(price), float(fee_per_share)
         return None
 
+    def open_leg_position(self, condition_id: str | None,
+                          token_id: str | None) -> tuple[float, float] | None:
+        """Unsettled ``(shares, total_cost)`` for one leg, or None.
+
+        open_leg_basis answers "what did a share cost"; the recovery leg needs
+        "how much is committed", which is shares and the cash already sunk
+        including fees. Deriving one from the other loses the rounding the
+        venue actually applied, so this reads the position directly.
+        """
+        condition = str(condition_id or "")
+        token = str(token_id or "")
+        if not condition or not token:
+            return None
+        with self._lock:
+            for position in self.positions.values():
+                if (position.condition_id != condition
+                        or position.token_id != token
+                        or position.settled or position.shares <= 0):
+                    continue
+                shares = float(position.shares)
+                cost = float(position.cost) + float(position.fees)
+                if (not math.isfinite(shares) or shares <= 0
+                        or not math.isfinite(cost) or cost < 0):
+                    return None
+                return shares, cost
+        return None
+
     def recovery_conditions(self, *, now: float | None = None,
                             lookback_s: float = RECOVERY_LOOKBACK_SECONDS,
                             ) -> tuple[str, ...]:
