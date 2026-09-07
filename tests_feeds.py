@@ -1445,25 +1445,22 @@ TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook
                  "chainlink.py", "market_discovery.py", "price_ws.py", "timer.py",
                  "config.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
-    # Re-approved 2026-09-07 for two live-latency fixes, both measured.
-    # polymarket_trade: the SDK's httpx client took httpx's 5s default
-    # keepalive_expiry while orders go out every 12s, so every live order
-    # paid a fresh TCP+TLS handshake. Held for 300s instead (+86ms/order on
-    # a warm link, seconds on a cold one).
-    # orderbook/main_bot: validate_buy_liquidity re-fetched a book the caller
-    # had just read microseconds earlier - a full 371-763ms round trip for
-    # the same leg. It now accepts book=, and main_bot passes the final
-    # validation book only when the token matches AND the stamp is under
-    # _FINAL_BOOK_REUSE_SECONDS, so the pair-lock and multi-signal branches
-    # invalidate the reuse by themselves rather than by hand-tracing.
+    # Re-approved 2026-09-07 after normalising line endings to LF.
+    # These hashes are over raw BYTES, so a CRLF working copy on Windows and
+    # an LF one on Linux produce different digests for identical source. The
+    # previous set was recorded on Windows where three files still carried
+    # CRLF, and they failed on a Linux checkout - the guard firing on a
+    # platform difference rather than on an edit, which is exactly the noise
+    # that made it useless before. .gitattributes now pins text files to LF
+    # so the digest means the same thing on both.
     "main_bot.py": "3c95120ffb6d6ac4fc185da153eaa6d8608a0a8105c15b4d1bdd3841fc5b25f1",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "587153e96294e591864e87ec10bfc7b7135a76dd193aba993aa32980ab3ae3a6",
     "orderbook.py": "ebe82f7071b8e3113b4b371164a875aac3a505cd7f8a4eb92817e56aa3ca681a",
-    "chainlink.py": "c20ac69ee93bb06df32552d3cd802ae3b45137dbfd0151ddd19a46e9c29a671d",
-    "market_discovery.py": "2fd6d42b5c52580cd6f95edf11567f154632319fe1e2910d9afcbfe8d4317a5f",
+    "chainlink.py": "c638f4276249b48131592d31a57f808565509e7d12be6db2d5b73b2dff1513b8",
+    "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
-    "timer.py": "fc829d5264e65f925ec32c8fbd30d0c0839249eaf4b425dbe6454a4ccaaa7097",
+    "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
     "config.py": "b3980ebdc04bee93a7d32b61913e54293cfeff2f952121456f56a6f1a6aa72f2",
 }
 SIDES = (None, "UP", "DOWN")
