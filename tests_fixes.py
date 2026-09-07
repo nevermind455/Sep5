@@ -2022,8 +2022,14 @@ def _drive_recovery(*, ask, shares, cost, t_left, held=None, enabled=True,
         rep(main_bot.config, "RECOVERY_LEG_BUDGET", budget)
         rep(main_bot.config, "TRADE_LAST_SECONDS", 300)
         rep(main_bot.config, "VENUE_MIN_SHARES", 5.0)
+        # The helper models ONE held leg: the position provider answers for the
+        # held token and returns None for the other. Returning the same tuple
+        # for both would read as a balanced pair, which correctly does not
+        # fire and would silently hollow out every case below.
+        held_token = (held if held is not None else (UP,))[0]
         rep(main_bot, "_round_leg_position_provider",
-            (lambda _c, _t: (shares, cost)) if provider else None)
+            (lambda _c, tok: (shares, cost) if tok == held_token else None)
+            if provider else None)
         rep(main_bot.orderbook, "get_orderbook",
             lambda _t, *_a, **_k: (
                 [{"price": f"{max(ask - 0.01, 0.01):.2f}", "size": "9999"}],
@@ -2033,6 +2039,7 @@ def _drive_recovery(*, ask, shares, cost, t_left, held=None, enabled=True,
                 seen["orders"].append((side, round(float(amount), 2))), True)[1])
         rep(main_bot, "_append_trade", lambda row: seen["rows"].append(row))
         main_bot._recovery_fired.clear()
+        main_bot._recovery_tokens.clear()
         if already:
             main_bot._recovery_fired.add(COND)
         held_set = set(held if held is not None else (UP,))
@@ -2047,6 +2054,7 @@ def _drive_recovery(*, ask, shares, cost, t_left, held=None, enabled=True,
         for obj, name, value in reversed(saved):
             setattr(obj, name, value)
         main_bot._recovery_fired.clear()
+        main_bot._recovery_tokens.clear()
 
 
 def t_recovery_leg_fires_on_a_cheap_opposite_with_time_left():
@@ -2065,7 +2073,6 @@ def t_recovery_leg_refuses_outside_its_gates():
             ("feature flag off", dict(enabled=False)),
             ("already fired this market", dict(already=True)),
             ("no position provider", dict(provider=False)),
-            ("both legs already held", dict(held=("111", "222"))),
             ("budget under the venue minimum", dict(budget=1.0)),
     ):
         base = dict(ask=0.19, shares=15.0, cost=9.96, t_left=200)
@@ -2073,6 +2080,62 @@ def t_recovery_leg_refuses_outside_its_gates():
         seen = _drive_recovery(**base)
         check(f"recovery leg refuses: {label}",
               seen["orders"] == [], str(seen["orders"]))
+
+
+def t_recovery_leg_handles_a_position_on_both_legs():
+    """Signal flips let phase 2 hold both legs, and 20 UP vs 5 DOWN is still
+    exposed. Refusing that case left the feature idle exactly when an
+    unbalanced pair needed it. It buys the side holding FEWER shares."""
+    import main_bot
+    up, dn = "111", "222"
+    tokens = {"condition_id": "0x" + "a" * 64,
+              "up_token_id": up, "down_token_id": dn}
+
+    def drive(up_pos, dn_pos, ask=0.15):
+        seen = {"orders": []}
+        saved = []
+
+        def rep(obj, name, value):
+            saved.append((obj, name, getattr(obj, name)))
+            setattr(obj, name, value)
+
+        try:
+            rep(main_bot.config, "RECOVERY_LEG_ENABLED", True)
+            rep(main_bot.config, "RECOVERY_LEG_MAX_PRICE", 0.30)
+            rep(main_bot.config, "RECOVERY_LEG_MIN_SECONDS", 120.0)
+            rep(main_bot.config, "RECOVERY_LEG_BUDGET", 1e9)
+            rep(main_bot.config, "TRADE_LAST_SECONDS", 300)
+            rep(main_bot.config, "VENUE_MIN_SHARES", 5.0)
+            rep(main_bot, "_round_leg_position_provider",
+                lambda _c, tok: up_pos if tok == up else dn_pos)
+            rep(main_bot.orderbook, "get_orderbook",
+                lambda _t, *_a, **_k: (
+                    [{"price": f"{ask - 0.01:.2f}", "size": "9999"}],
+                    [{"price": f"{ask:.2f}", "size": "9999"}]))
+            rep(main_bot, "place_trade",
+                lambda side, amount, *_a, **_k: (
+                    seen["orders"].append(side), True)[1])
+            rep(main_bot, "_append_trade", lambda _r: None)
+            main_bot._recovery_fired.clear()
+            main_bot._recovery_tokens.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                asyncio.run(main_bot._maybe_recovery_leg(
+                    "PAPER", tokens, up, dn, {up, dn}, 200.0, 1_788_000_000))
+            return seen["orders"]
+        finally:
+            for obj, name, value in reversed(saved):
+                setattr(obj, name, value)
+            main_bot._recovery_fired.clear()
+            main_bot._recovery_tokens.clear()
+
+    check("UP-heavy pair buys the DOWN leg",
+          drive((20.0, 13.0), (5.0, 1.0)) == ["DOWN"], "")
+    check("DOWN-heavy pair buys the UP leg",
+          drive((5.0, 1.0), (20.0, 13.0)) == ["UP"], "")
+    check("a balanced pair does not fire",
+          drive((10.0, 6.5), (10.0, 6.5)) == [], "")
+    check("an empty market does not fire",
+          drive(None, None) == [], "")
 
 
 def t_recovery_leg_refuses_a_position_that_is_not_winning():

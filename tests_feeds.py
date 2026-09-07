@@ -1445,14 +1445,15 @@ TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook
                  "chainlink.py", "market_discovery.py", "price_ws.py", "timer.py",
                  "config.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
-    # Re-approved 2026-09-07: a recovery leg no longer answers the
-    # complement-leg block. It was added to held_tokens, so that block saw
-    # BOTH sides held and refused whichever side phase 2 wanted next - phase 2
-    # stopped for the rest of the round after every recovery leg, observed in
-    # multi_fills.csv. Recovery legs are tracked in _recovery_tokens instead;
-    # exposure and durable recovery read the ledger, which holds the position
-    # either way, and a genuine two-leg phase-2 position is still refused.
-    "main_bot.py": "af64b6b427dda25df9bbaab843e9f2346d27b37cfae6e3b687b34bf470080ab2",
+    # Re-approved 2026-09-07: the recovery leg reads BOTH legs and buys the
+    # side holding fewer shares. Signal flips let phase 2 hold both, and
+    # 20 UP vs 5 DOWN is still exposed to a reversal - the old "exactly one
+    # leg" rule left the feature idle exactly when an unbalanced pair needed
+    # it. Sizing now honours two bounds: the strong side caps the spend, and
+    # the weak side needs a FLOOR, because buying too few shares leaves it
+    # short of the money already committed. Checking only the cap let 111 of
+    # 1,775 randomised cases settle negative on the side being protected.
+    "main_bot.py": "7aca0683ca6406cb89b93464a8e302d1355923fd00f188fe6340e8cc7f18e4fc",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "33dd2024bdaeace46aefb9d6da561e8f989ec767ebdda8083ec6ed84295048c3",
     "orderbook.py": "ebe82f7071b8e3113b4b371164a875aac3a505cd7f8a4eb92817e56aa3ca681a",

@@ -348,25 +348,40 @@ async def _maybe_recovery_leg(mode, tokens, up_id, down_id, held_tokens,
     if not (config.RECOVERY_LEG_MIN_SECONDS <= exact_remaining
             <= config.TRADE_LAST_SECONDS):
         return
-    # Which leg is held? Exactly one, or there is nothing to protect.
-    held = [t for t in (up_id, down_id) if t in held_tokens]
-    if len(held) != 1:
-        return
-    held_token = held[0]
-    other_token = down_id if held_token == up_id else up_id
-    other_side = "DOWN" if held_token == up_id else "UP"
+    # Both legs are read, not just one. Signal flips let phase 2 hold both,
+    # and 20 UP against 5 DOWN is still exposed to a reversal - refusing that
+    # case left the feature idle exactly when an unbalanced pair needed it.
     try:
-        position = _round_leg_position_provider(condition, held_token)
+        legs = {}
+        for token in (up_id, down_id):
+            if not token:
+                continue
+            got = _round_leg_position_provider(condition, token)
+            legs[token] = (float(got[0]), float(got[1])) if got else (0.0, 0.0)
     except Exception as exc:
         print(f"{_ts()} [RISK] recovery skip: position unreadable "
               f"({type(exc).__name__}).")
         return
-    if not position:
-        return
-    shares, cost = float(position[0]), float(position[1])
-    headroom = shares - cost
+    up_shares, up_cost = legs.get(up_id, (0.0, 0.0))
+    dn_shares, dn_cost = legs.get(down_id, (0.0, 0.0))
+    if up_shares <= 0 and dn_shares <= 0:
+        return                       # nothing held; nothing to protect
+    if up_shares == dn_shares:
+        return                       # balanced: both outcomes already pay alike
+    # Buy the WEAK side - the one holding fewer shares, which is what a
+    # reversal would leave you on.
+    if up_shares < dn_shares:
+        other_token, other_side, strong_shares = up_id, "UP", dn_shares
+    else:
+        other_token, other_side, strong_shares = down_id, "DOWN", up_shares
+    # Everything already committed to this market, both legs. The strong
+    # side's payout must still cover it after the buy, which is what stops a
+    # recovery leg turning a winning pair into a losing one.
+    cost = up_cost + dn_cost
+    headroom = strong_shares - cost
     if not math.isfinite(headroom) or headroom <= 0:
-        return                       # position is not winning; nothing to spend
+        return                       # not winning on either side; nothing to spend
+    shares = strong_shares
     try:
         _bids, asks = await asyncio.to_thread(orderbook.get_orderbook, other_token)
     except Exception as exc:
@@ -382,7 +397,24 @@ async def _maybe_recovery_leg(mode, tokens, up_id, down_id, held_tokens,
     denom = ask + fee_per_share
     if denom <= 0:
         return
+    # Two bounds, not one. The strong side caps the spend (headroom/denom),
+    # but the WEAK side needs a FLOOR: buying too few shares leaves it short
+    # of the money already committed, so it settles negative. Solving
+    #     weak + M - cost - M*denom >= 0
+    # gives M >= (cost - weak) / (1 - denom). With one leg held these rarely
+    # collide; with two they do, and checking only the cap let a recovery leg
+    # settle at a loss on the very side it was meant to protect.
+    weak_shares = up_shares if other_side == "UP" else dn_shares
     qty = math.floor(headroom / denom)
+    if denom < 1.0:
+        need = (cost - weak_shares) / (1.0 - denom)
+        if need > qty:
+            print(f"{_ts()} [RISK] recovery skip: {other_side} @ {ask:.3f} needs "
+                  f"{math.ceil(need):.0f} shares to clear its own cost but the "
+                  f"position only funds {qty:.0f}.")
+            return
+        qty = max(qty, math.ceil(need)) if need > 0 else qty
+        qty = min(qty, math.floor(headroom / denom))
     # Never exceed the feature's own budget, so it cannot starve a normal
     # entry the way a shared MAX_ROUND_EXPOSURE would.
     while qty >= config.VENUE_MIN_SHARES and qty * denom > config.RECOVERY_LEG_BUDGET:
@@ -393,8 +425,10 @@ async def _maybe_recovery_leg(mode, tokens, up_id, down_id, held_tokens,
               f"{config.VENUE_MIN_SHARES:.0f}).")
         return
     spend = qty * ask + fees.taker_fee(qty, ask)
-    up_pnl = (shares if held_token == up_id else qty) - cost - spend
-    dn_pnl = (qty if held_token == up_id else shares) - cost - spend
+    # The weak side gains qty shares; the strong side is unchanged. Both
+    # projections net off everything committed to this market, both legs.
+    up_pnl = (up_shares + (qty if other_side == "UP" else 0.0)) - cost - spend
+    dn_pnl = (dn_shares + (qty if other_side == "DOWN" else 0.0)) - cost - spend
     print(f"{_ts()} [BOT] RECOVERY LEG | {other_side} | px {ask:.3f} | "
           f"{qty:.0f}sh | cost ${spend:.2f} | t-left {exact_remaining:.0f}s | "
           f"UP PnL ${up_pnl:+.2f} | DOWN PnL ${dn_pnl:+.2f}")
