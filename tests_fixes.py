@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import inspect
 import importlib.util
 import io
 import json
@@ -2112,6 +2113,38 @@ def t_recovery_leg_claims_its_slot_once_per_market():
     check("firing records the condition so a second call cannot repeat it",
           seen["rows"] and seen["rows"][0]["phase"] == "recovery",
           str(seen["rows"][:1]))
+
+
+def t_recovery_leg_clears_the_account_price_floor():
+    """MIN_BUY_PRICE would otherwise reject every recovery order.
+
+    The gate tests stub place_trade, so they cannot see this: the account
+    floor is applied inside _place_trade. With MIN_BUY_PRICE=0.30 and a
+    recovery cap of 0.20 the floor lands ABOVE the cap and the order raises
+    "the effective price floor is above the order's price cap" - the whole
+    feature silently inert. below_account_floor is the named exception.
+    """
+    from decimal import Decimal
+    import polymarket_trade
+    import main_bot
+    tick = Decimal("0.01")
+    cap = Decimal(str(min(main_bot.config.RECOVERY_LEG_MAX_PRICE,
+                          main_bot.config.MAX_BUY_PRICE)))
+    limit = polymarket_trade._round_limit(cap, tick)
+    without = polymarket_trade._round_floor(
+        Decimal(str(main_bot.config.MIN_BUY_PRICE)), tick)
+    with_exc = polymarket_trade._round_floor(Decimal("0"), tick)
+    check("the account floor alone would reject a recovery order",
+          without > limit or main_bot.config.MIN_BUY_PRICE <= float(cap),
+          f"floor {without} vs cap {limit}")
+    check("below_account_floor lets a recovery order clear its own cap",
+          with_exc <= limit, f"floor {with_exc} vs cap {limit}")
+    check("place_trade exposes below_account_floor",
+          "below_account_floor" in inspect.signature(
+              polymarket_trade.place_trade).parameters, "")
+    check("the exception is off by default, so entries keep MIN_BUY_PRICE",
+          inspect.signature(polymarket_trade.place_trade)
+          .parameters["below_account_floor"].default is False, "")
 
 
 def main():

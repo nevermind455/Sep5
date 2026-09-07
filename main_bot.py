@@ -15,6 +15,7 @@ import price_ws
 import strategy
 import polymarket_trade
 from accounting import fees
+import functools
 import timer
 from polymarket_trade import cancel_all_open_orders, get_balance_allowance, place_trade
 from timer import current_round_window_et, now_et, seconds_left
@@ -393,9 +394,16 @@ async def _maybe_recovery_leg(mode, tokens, up_id, down_id, held_tokens,
     # Claim the one-per-market slot BEFORE submitting. A submission whose
     # result is unknown must not leave the door open for a second leg.
     _recovery_fired.add(condition)
+    # below_account_floor: MIN_BUY_PRICE exists to stop ENTRIES paying for
+    # lottery tickets. A recovery leg is not an entry - it deliberately buys
+    # the leg the market has written off, which is under that floor by
+    # definition. Without this the order raises "floor above cap" and the
+    # whole feature is silently inert.
     ok = await asyncio.to_thread(
-        place_trade, other_side, spend, up_id, down_id, condition, round_end,
-        min(config.RECOVERY_LEG_MAX_PRICE, config.MAX_BUY_PRICE))
+        functools.partial(
+            place_trade, other_side, spend, up_id, down_id, condition,
+            round_end, min(config.RECOVERY_LEG_MAX_PRICE, config.MAX_BUY_PRICE),
+            below_account_floor=True))
     if ok:
         held_tokens.add(other_token)
     _append_trade({

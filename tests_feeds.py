@@ -1445,18 +1445,17 @@ TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook
                  "chainlink.py", "market_discovery.py", "price_ws.py", "timer.py",
                  "config.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
-    # Re-approved 2026-09-07 for the recovery leg (RECOVERY_LEG_ENABLED,
-    # default OFF). One buy of the cheap opposite leg while a position is
-    # winning, sized to spend only that position's unrealised profit, so a
-    # fired leg cannot turn a winner into a loser - verified over 3,000
-    # randomised scenarios, 2,384 of which fired, zero violations.
-    # It is not a signal: no epoch observation, no vote, no flip, no reversal,
-    # and it never continues out of the loop, so it cannot block phase 2. It
-    # does take an explicit exception to the complement-leg block, because
-    # holding both legs is the whole point.
-    "main_bot.py": "595d073ac57f7f3340609dd6c915bef256f4b2d800c46c0e4714f9c593a3f14e",
+    # Re-approved 2026-09-07: recovery leg needed a named exception to the
+    # account price floor. MIN_BUY_PRICE (0.30 here) is applied inside
+    # _place_trade and is raise-only, so a recovery cap of 0.20 put the floor
+    # ABOVE the cap and every order raised "floor above cap" - the feature was
+    # silently inert. below_account_floor=True is that exception, off by
+    # default, asked for by name. MIN_BUY_PRICE still guards normal entries;
+    # it exists to stop ENTRIES buying lottery tickets, and a recovery leg is
+    # not an entry.
+    "main_bot.py": "b6abe7796be46aa1391a720ff05306b90b0fda69f57dd8f8990789472dfd6dbe",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
-    "polymarket_trade.py": "587153e96294e591864e87ec10bfc7b7135a76dd193aba993aa32980ab3ae3a6",
+    "polymarket_trade.py": "33dd2024bdaeace46aefb9d6da561e8f989ec767ebdda8083ec6ed84295048c3",
     "orderbook.py": "ebe82f7071b8e3113b4b371164a875aac3a505cd7f8a4eb92817e56aa3ca681a",
     "chainlink.py": "c638f4276249b48131592d31a57f808565509e7d12be6db2d5b73b2dff1513b8",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",

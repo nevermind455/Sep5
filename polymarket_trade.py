@@ -780,7 +780,8 @@ def place_trade(side: str, amount: float, up_token_id: str | None = None,
                 window_end: float | None = None,
                 max_price: float | None = None,
                 min_price: float | None = None, *,
-                pre_submit_guard=None) -> bool:
+                pre_submit_guard=None,
+                below_account_floor: bool = False) -> bool:
     """Serialize live submissions so two callers cannot duplicate an entry.
 
     `max_price` caps this order alone, and may only tighten MAX_BUY_PRICE.
@@ -801,7 +802,8 @@ def place_trade(side: str, amount: float, up_token_id: str | None = None,
     try:
         return _place_trade(side, amount, up_token_id, down_token_id,
                             condition_id, window_end, max_price, min_price,
-                            pre_submit_guard=pre_submit_guard)
+                            pre_submit_guard=pre_submit_guard,
+                            below_account_floor=below_account_floor)
     finally:
         _execution_lock.release()
 
@@ -812,7 +814,8 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                  window_end: float | None = None,
                  max_price: float | None = None,
                  min_price: float | None = None, *,
-                 pre_submit_guard=None) -> bool:
+                 pre_submit_guard=None,
+                below_account_floor: bool = False) -> bool:
     global last_order_error, last_order_status, last_order_receipt, _journal_fault
     last_order_error = None
     last_order_status = None
@@ -883,6 +886,15 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             ceiling = min(ceiling, float(max_price))
         limit = _round_limit(ceiling, rules["tick"])
         base_floor = config.MIN_BUY_PRICE
+        if below_account_floor:
+            # The one exception, and it must be asked for by name. The
+            # recovery leg exists to buy a leg the market has already written
+            # off, which is below MIN_BUY_PRICE by definition - that floor
+            # protects ENTRIES from paying for lottery tickets, and a recovery
+            # leg is not an entry. Without this the order raises "floor above
+            # cap" and the feature is silently inert. Deliberately not
+            # reachable by leaving min_price unset: a caller has to say it.
+            base_floor = 0.0
         if min_price is not None:
             # Raise only, mirroring the ceiling's tighten-only rule: an order
             # floor can never drop below the account-wide minimum.
