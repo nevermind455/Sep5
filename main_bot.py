@@ -57,6 +57,13 @@ _round_leg_position_provider = None
 # Conditions that already fired their one recovery leg. Keyed by condition so
 # it survives a round-window recalculation, and cleared on rotation.
 _recovery_fired: set[str] = set()
+# Tokens acquired by a recovery leg, kept apart from held_tokens. The
+# complement-leg block asks "do I already hold the other side", and a
+# recovery leg makes that true for BOTH sides - which silently stopped phase 2
+# for the rest of the round, the exact interference this feature promised not
+# to cause. A recovery leg is not a directional position and must not answer
+# that question. Cleared on rotation with the rest of the per-round state.
+_recovery_tokens: set[str] = set()
 _execution_ready_provider = None
 
 # Set by run_feeds / run_terminal when the RTDS 60-second TWAP feed is running.
@@ -405,7 +412,11 @@ async def _maybe_recovery_leg(mode, tokens, up_id, down_id, held_tokens,
             round_end, min(config.RECOVERY_LEG_MAX_PRICE, config.MAX_BUY_PRICE),
             below_account_floor=True))
     if ok:
-        held_tokens.add(other_token)
+        # NOT held_tokens: that set answers the complement-leg block, and a
+        # recovery leg answering it would stop phase 2 trading for the rest of
+        # the round. Exposure and durable recovery read the ledger, which has
+        # the position either way.
+        _recovery_tokens.add(other_token)
     _append_trade({
         "time_et": now_et().strftime("%b %d %H:%M:%S ET"),
         "phase": "recovery",
@@ -735,6 +746,7 @@ async def run_bot():
             # window so a re-discovered condition in the same round still
             # counts as already fired.
             _recovery_fired.clear()
+            _recovery_tokens.clear()
             signal_epoch = _RoundSignalEpoch()
             # LIVE authorizations are keyed by the known five-minute window,
             # so they can be restored before discovery. PAPER inventory is
@@ -941,7 +953,8 @@ async def run_bot():
                 await asyncio.sleep(0.2)
                 continue
             other_token = down_id if side == "UP" else up_id
-            if other_token in held_tokens:
+            if (other_token in held_tokens
+                    and other_token not in _recovery_tokens):
                 lock_ok, lock_detail = _pair_lock_permit(
                     tokens["condition_id"], other_token, ask)
                 if not lock_ok:
@@ -1314,7 +1327,8 @@ async def run_bot():
                 continue
 
             other_token = down_id if side == "UP" else up_id
-            if other_token in held_tokens:
+            if (other_token in held_tokens
+                    and other_token not in _recovery_tokens):
                 flip_allowed = False
                 flip_detail = "PAPER signal-flip mode is disabled"
                 flips_enabled = (config.PAPER_ALLOW_SIGNAL_FLIPS if mode == "PAPER"

@@ -2168,6 +2168,41 @@ def t_every_execution_path_accepts_the_floor_exception():
               and params["below_account_floor"].default is False, "")
 
 
+def t_recovery_leg_does_not_block_phase_two():
+    """The complement-leg block must ignore recovery-acquired legs.
+
+    Observed live: phase 2 stopped for the rest of the round after every
+    recovery leg. The leg was added to held_tokens, so the complement check
+    saw BOTH sides held and refused whichever side phase 2 wanted next -
+    exactly the interference this feature promised not to cause.
+    """
+    import main_bot
+    up, dn = "111", "222"
+    main_bot._recovery_tokens.clear()
+    try:
+        held = {up}                       # phase 2 holds UP
+        main_bot._recovery_tokens.add(dn)  # recovery bought DOWN
+
+        def blocked(side):
+            other = dn if side == "UP" else up
+            return (other in held
+                    and other not in main_bot._recovery_tokens)
+
+        check("phase 2 may keep buying its own side after a recovery leg",
+              not blocked("UP"), "UP was blocked")
+        check("phase 2 is still blocked from the leg it genuinely holds",
+              blocked("DOWN"), "DOWN was not blocked")
+        check("a recovery leg does not enter held_tokens",
+              dn not in held, str(sorted(held)))
+    finally:
+        main_bot._recovery_tokens.clear()
+
+    # the guard still works for two genuine phase-2 legs
+    held_both = {up, dn}
+    check("a real phase-2 complement is still refused",
+          up in held_both and up not in main_bot._recovery_tokens, "")
+
+
 def main():
     # A crashing test must be one failure, not a suite that stops reporting.
     def run(fn, is_async=False):

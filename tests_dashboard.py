@@ -704,14 +704,14 @@ TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook
                  "config.py"]
 
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
-    # Re-approved 2026-09-07. below_account_floor now exists on BOTH execution
-    # paths. PaperBroker.place_trade is a separate implementation bound over
-    # main_bot.place_trade in paper mode, so the live-only version crashed the
-    # bot with TypeError on the first recovery attempt, and its own
-    # place_trade/_place_trade split meant the flag had to be forwarded as
-    # well as accepted. Paper must honour the same exception or paper results
-    # would misdescribe live.
-    "main_bot.py": "b6abe7796be46aa1391a720ff05306b90b0fda69f57dd8f8990789472dfd6dbe",
+    # Re-approved 2026-09-07: a recovery leg no longer answers the
+    # complement-leg block. It was added to held_tokens, so that block saw
+    # BOTH sides held and refused whichever side phase 2 wanted next - phase 2
+    # stopped for the rest of the round after every recovery leg, observed in
+    # multi_fills.csv. Recovery legs are tracked in _recovery_tokens instead;
+    # exposure and durable recovery read the ledger, which holds the position
+    # either way, and a genuine two-leg phase-2 position is still refused.
+    "main_bot.py": "af64b6b427dda25df9bbaab843e9f2346d27b37cfae6e3b687b34bf470080ab2",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "33dd2024bdaeace46aefb9d6da561e8f989ec767ebdda8083ec6ed84295048c3",
     "orderbook.py": "ebe82f7071b8e3113b4b371164a875aac3a505cd7f8a4eb92817e56aa3ca681a",
