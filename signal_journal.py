@@ -39,6 +39,8 @@ sys.path.insert(0, str(ROOT))
 
 import market_discovery                      # noqa: E402
 import orderbook                             # noqa: E402
+import time as _t
+
 import timer                                 # noqa: E402
 from chainlink_strike import ChainlinkStrike  # noqa: E402
 
@@ -51,7 +53,7 @@ BOUNDARY_GRACE = 5.0
 
 FIELDS = ["wall", "window", "secs_left", "cl_strike", "cl_now",
           "bn_strike", "bn_now", "up_ask", "up_bid", "dn_ask", "dn_bid",
-          "up_bid_vol", "up_ask_vol"]
+          "up_bid_vol", "up_ask_vol", "dn_bid_vol", "dn_ask_vol"]
 
 
 # --------------------------------------------------------------- recording ---
@@ -89,6 +91,29 @@ async def record(interval: float) -> int:
 
     bn_strike: dict[int, float] = {}
     new = not JOURNAL.exists()
+    if not new:
+        # Appending 15-column rows under a 13-column header silently misaligns
+        # every later row. Retire the old file instead; the resolved winners
+        # live in a separate json and still apply to it.
+        with JOURNAL.open(encoding="utf-8") as _fh:
+            _head = (_fh.readline() or "").strip().split(",")
+        if _head != FIELDS:
+            _retired = JOURNAL.with_name(f"{JOURNAL.stem}.{int(_t.time())}.csv")
+            try:
+                JOURNAL.rename(_retired)
+            except OSError as _exc:
+                # Windows refuses to rename a file another process holds open,
+                # which here means a second recorder is already running. Say so
+                # plainly: appending the new schema under the old header would
+                # misalign every later row, and two writers on one file is a
+                # bug either way.
+                raise SystemExit(
+                    f"[JOURNAL] cannot retire the old-schema {JOURNAL.name} "
+                    f"({type(_exc).__name__}). Another recorder is probably "
+                    f"still running - stop it, or move the file aside."
+                ) from None
+            print(f"[JOURNAL] schema changed; previous file kept as {_retired.name}")
+            new = True
     try:
         with JOURNAL.open("a", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=FIELDS)
@@ -131,7 +156,7 @@ async def record(interval: float) -> int:
                     try:
                         up_ask, up_bid, up_bv, up_av = await asyncio.to_thread(
                             _book, tokens["up_token_id"])
-                        dn_ask, dn_bid, _bv, _av = await asyncio.to_thread(
+                        dn_ask, dn_bid, dn_bv, dn_av = await asyncio.to_thread(
                             _book, tokens["down_token_id"])
                     except Exception as exc:
                         print(f"[JOURNAL] book skipped "
@@ -152,6 +177,11 @@ async def record(interval: float) -> int:
                         "dn_ask": "" if dn_ask is None else dn_ask,
                         "dn_bid": "" if dn_bid is None else dn_bid,
                         "up_bid_vol": f"{up_bv:.2f}", "up_ask_vol": f"{up_av:.2f}",
+                        # SIG BOOK votes on the UP leg alone, so the DOWN
+                        # leg's depth was never recorded and a two-leg book
+                        # signal could not be tested against this journal.
+                        # _book already computed these; they were discarded.
+                        "dn_bid_vol": f"{dn_bv:.2f}", "dn_ask_vol": f"{dn_av:.2f}",
                     })
                     fh.flush()
                 await asyncio.sleep(max(1.0, interval))
