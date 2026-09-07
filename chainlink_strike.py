@@ -211,7 +211,20 @@ class ChainlinkStrike:
                 continue
 
     async def _session(self) -> None:
-        async with websockets.connect(self.url, ping_interval=None,
+        # Protocol-level ping, answered automatically by any conformant
+        # WebSocket peer. This used to be ping_interval=None plus an
+        # application-level "PING" text frame, but RTDS has no such
+        # application heartbeat: it publishes ~1/s and never replies "PONG",
+        # so the custom heartbeat timed out PING_EVERY+PONG_TIMEOUT after
+        # connecting and closed the socket with 1011 - a 10s connect/die loop
+        # that left SIG CHAINLINK missing most of the time. Verified on the
+        # wire: a raw subscriber that sends nothing stays up indefinitely and
+        # receives ~1 frame/s. The half-open detection the custom heartbeat
+        # existed for is preserved, and now uses the mechanism the peer
+        # actually implements.
+        async with websockets.connect(self.url,
+                                      ping_interval=PING_EVERY,
+                                      ping_timeout=PONG_TIMEOUT,
                                       open_timeout=10, close_timeout=2) as ws:
             # A connection opened inside a window cannot reconstruct that
             # window's first print: RTDS has no snapshot or replay.
@@ -231,58 +244,16 @@ class ChainlinkStrike:
                 ],
             }))
             self._event("connected to Chainlink 60s TWAP RTDS", "good")
-            ping = asyncio.create_task(self._ping(ws))
             try:
                 while not self._stop.is_set():
                     raw = await asyncio.wait_for(ws.recv(), timeout=30)
                     self._handle(raw)
             finally:
-                ping.cancel()
-                try:
-                    await ping
-                except asyncio.CancelledError:
-                    pass
-                except Exception as exc:
-                    self.last_error = f"heartbeat task failed: {type(exc).__name__}: {exc}"[:160]
-                    self._event(self.last_error, "bad")
                 self._connection_window = None
                 self.connected = False
                 # Retain the last value for diagnostics, but a disconnected
                 # socket must not continue supplying a decision input.
                 self.value_mono = None
-
-    async def _ping(self, ws) -> None:
-        """Send PING and require an answer.
-
-        Sending alone proves nothing: a half-open socket accepts writes into a
-        vanished peer indefinitely, and the only other thing that would notice
-        is the 30s receive timeout - six times the TWAP's own staleness bound,
-        so SIG CHAINLINK is dead for the whole of it. Requiring the PONG turns
-        that into roughly PING_EVERY + PONG_TIMEOUT.
-        """
-        while True:
-            await asyncio.sleep(PING_EVERY)
-            try:
-                self._pong_event.clear()
-                await ws.send("PING")
-                await asyncio.wait_for(self._pong_event.wait(),
-                                       timeout=PONG_TIMEOUT)
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                self.last_error = "heartbeat response timeout"
-                try:
-                    await ws.close(code=1011, reason="heartbeat response timeout")
-                except Exception as close_exc:
-                    self.last_error = f"heartbeat close failed: {type(close_exc).__name__}"
-                return
-            except Exception as exc:
-                self.last_error = f"heartbeat send failed: {type(exc).__name__}"
-                try:
-                    await ws.close(code=1011, reason="heartbeat failed")
-                except Exception as close_exc:
-                    self.last_error = f"heartbeat close failed: {type(close_exc).__name__}"
-                return
 
     def _reject(self, reason: str) -> None:
         """Record malformed data without throwing the whole socket away."""
